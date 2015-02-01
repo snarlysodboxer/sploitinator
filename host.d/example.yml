@@ -1,0 +1,17 @@
+hosts:
+  - name: host1.example.com
+    services:
+      - name: ssh
+        ports: [22, 23]
+
+      - name: nginx
+        ports: [80, 443, 8080]
+
+      - name: nginxssl
+        ports: [443, 8080]
+
+      - name: rails
+        ports: [443]
+
+      - name: postgres
+        ports: [5432, 5433]

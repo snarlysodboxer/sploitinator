@@ -1,0 +1,39 @@
+services:
+  - name: ssh
+    modules:
+    - name: "auxiliary/ssh/blah"
+      options: "SSL_VERSION => SSL3"
+      pluralhosts: false
+      cronspec: "30 * * * *"
+    - name: "auxiliary/ssh/blahdittyblah"
+      options: ""
+      pluralhosts: false
+      cronspec: "30 * * * *"
+
+  - name: nginx
+    modules:
+    - name: "auxiliary/nginx/testing123"
+      options: ""
+      pluralhosts: true
+      cronspec: "30 * * * *"
+
+  - name: nginxssl
+    modules:
+    - name: "auxiliary/nginxssl/ssl"
+      options: "SSL_VERSION => SSL3"
+      pluralhosts: false
+      cronspec: "30 * * * *"
+
+  - name: rails
+    modules:
+    - name: "auxiliary/rails/railsssl"
+      options: "SSL_VERSION => SSL3"
+      pluralhosts: true
+      cronspec: "30 * * * *"
+
+  - name: postgres
+    modules:
+    - name: "auxiliary/postgres/blahello"
+      options: "SSL_VERSION => SSL3"
+      pluralhosts: false
+      cronspec: "30 * * * *"
