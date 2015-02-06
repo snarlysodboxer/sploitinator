@@ -3,6 +3,7 @@ package main
 import (
 	"fmt"
 	flag "github.com/ogier/pflag"
+	"github.com/snarlysodboxer/msfapi"
 	// "gopkg.in/fsnotify.v1"
 	"gopkg.in/robfig/cron.v2"
 	"gopkg.in/yaml.v2"
@@ -15,30 +16,42 @@ import (
 	"syscall"
 )
 
+type config struct {
+	MsfApiUri   string
+	Username    string
+	Password    string
+	WatchDir    string
+	ModulesFile string
+}
+
 type module struct {
-	Name        string
-	Options     string
-	PluralHosts bool
-	CronSpec    string
+	Type     string
+	Name     string
+	Options  map[string]interface{}
+	CronSpec string
+}
+
+type host struct {
+	Name     string
+	Services []struct {
+		Name  string
+		Ports []int
+	}
+}
+
+type service struct {
+	Name    string
+	Modules []module
 }
 
 type Daemon struct {
-	Hosts []struct {
-		Name     string
-		Services []struct {
-			Name  string
-			Ports []int
-		}
-	}
-	Services []struct {
-		Name    string
-		Modules []module
-	}
+	Hosts         []host
+	Services      []service
+	API           *msfapi.API
 	interruptChan chan os.Signal
 	cron          cron.Cron
 	waitGroup     sync.WaitGroup
-	configDir     string
-	modulesFile   string
+	config        config
 }
 
 // initialize a Daemon
@@ -66,46 +79,62 @@ func (daemon *Daemon) CreateInterruptChan() {
 	}()
 }
 
-// read modules.yml and map service names to Metasploit modules
-func (daemon *Daemon) LoadModuleMappings() {
-	contents, err := ioutil.ReadFile(daemon.modulesFile)
+// read sploit.yml and set settings
+func (daemon *Daemon) LoadSploitYaml(configFile string) {
+	contents, err := ioutil.ReadFile(configFile)
 	if err != nil {
 		log.Fatal(err)
 	}
-	err = yaml.Unmarshal([]byte(contents), daemon)
+	config := config{}
+	err = yaml.Unmarshal([]byte(contents), &config)
 	if err != nil {
 		log.Fatal(err)
 	}
-	log.Printf("Loading mapped service names to Metasploit modules:\n%v",
-		daemon.Services)
+	daemon.config = config
+	log.Println("Successfully loaded Sploit yaml file")
 }
 
-// watch modules.yml file and reload upon changes
-func (daemon *Daemon) CreateModuleMappingsWatcher() {
+// read modules.yml and map service names to Metasploit modules
+func (daemon *Daemon) LoadModulesYaml() {
+	contents, err := ioutil.ReadFile(daemon.config.ModulesFile)
+	if err != nil {
+		log.Fatal(err)
+	}
+	services := []service{}
+	err = yaml.Unmarshal([]byte(contents), &services)
+	if err != nil {
+		log.Fatal(err)
+	}
+	daemon.Services = services // overwrite old
+	log.Println("Successfully loaded modules yaml file")
 }
 
 // read host.yml files from host.d into daemon.Hosts
 func (daemon *Daemon) LoadHostYamls() {
-	files, err := ioutil.ReadDir(fmt.Sprintf("./%s", daemon.configDir))
+	files, err := ioutil.ReadDir(fmt.Sprintf("./%s", daemon.config.WatchDir))
 	if err != nil {
 		log.Fatal(err)
 	}
+	hosts := []host{}
 	for _, file := range files {
 		if !file.IsDir() {
 			regex := regexp.MustCompilePOSIX(".*.yml$")
 			if regex.MatchString(file.Name()) {
-				contents, err := ioutil.ReadFile(fmt.Sprintf("%s/%s", daemon.configDir, file.Name()))
+				contents, err := ioutil.ReadFile(fmt.Sprintf("%s/%s", daemon.config.WatchDir, file.Name()))
 				if err != nil {
 					log.Fatal(err)
 				}
-				err = yaml.Unmarshal([]byte(contents), daemon)
+				host := host{}
+				err = yaml.Unmarshal([]byte(contents), &host)
 				if err != nil {
 					log.Fatal(err)
 				}
-				log.Printf("Loaded %v into daemon.HostConfigs", daemon.Hosts)
+				hosts = append(hosts, host)
 			}
 		}
 	}
+	daemon.Hosts = hosts // overwrite old
+	log.Println("Successfully loaded hosts yaml files")
 }
 
 // create cron daemon
@@ -116,21 +145,56 @@ func (daemon *Daemon) CreateCronDaemon() {
 
 // setup cron entries which send api calls to msfrpcd
 func (daemon *Daemon) CreateCronEntries() {
+	for _, daemonService := range daemon.Services {
+		for _, module := range daemonService.Modules {
+			log.Printf("Creating a cron entry for: %#v", module)
+			// daemon.runModule(daemonService.Name, module)
+			daemon.cron.AddFunc(module.CronSpec, func() { daemon.runModule(daemonService.Name, module) })
+			daemon.waitGroup.Add(1)
+		}
+	}
+}
+
+// to be run by cron
+func (daemon *Daemon) runModule(serviceName string, module module) {
+	log.Printf("'%v'\n", module)
 	for _, host := range daemon.Hosts {
 		// for each host.service find the matching service-module mapping
 		for _, hostService := range host.Services {
-			for _, daemonService := range daemon.Services {
-				if hostService.Name == daemonService.Name {
-					log.Printf("'%s' '%d'\n", hostService.Name, hostService.Ports)
-					for _, module := range daemonService.Modules {
-						log.Printf("\t'%v'\n", module)
-					}
+			if hostService.Name == serviceName {
+				for _, port := range hostService.Ports {
+					log.Printf("\t'%s' '%s' '%d'\n", host.Name, serviceName, port)
+					daemon.apiModuleExecute(host.Name, port, module)
 				}
 			}
 		}
 	}
-	daemon.cron.AddFunc("@every 5s", func() { log.Println("Every five seconds") })
-	daemon.waitGroup.Add(1)
+}
+
+func (daemon *Daemon) apiModuleExecute(host string, port int, module module) {
+	err := daemon.API.AuthLogin(daemon.config.Username, daemon.config.Password)
+	if err != nil {
+		log.Fatal(err)
+	}
+
+	options := make(map[string]interface{})
+	for key, value := range module.Options {
+		options[key] = value
+	}
+	options["RHOSTS"] = host
+	options["RHOST"] = host
+	options["RPORT"] = port
+	jobID, err := daemon.API.ModuleExecute(module.Type, module.Name, options)
+	if err != nil {
+		log.Fatal(err)
+	}
+	log.Printf("Initiated module execution with job id %v.\n", jobID)
+
+	err = daemon.API.AuthLogout()
+	if err != nil {
+		log.Fatal(err)
+	}
+	log.Println("Successfully logged out.")
 }
 
 // remove all cron daemon entries
@@ -141,52 +205,76 @@ func (daemon *Daemon) RemoveCronEntries() {
 	}
 }
 
-// watch host.d dir and reload the cron entries upon changes
-func (daemon *Daemon) CreateHostDotDWatcher() {
-	// daemon.RemoveCronEntries()
-	// daemon.CreateCronEntries()
-}
+// // watch modules.yml file and host.d dir and recreate all cron entries upon changes
+// func (daemon *Daemon) CreateWatcher() {
+// 	// if modules.yml changes
+// 	// daemon.RemoveCronEntries()
+// 	// daemon.LoadModulesYaml()
+// 	// daemon.CreateCronEntries()
+// 	// if host.d/* changes
+// 	// daemon.RemoveCronEntries()
+// 	// daemon.LoadHostYamls()
+// 	// daemon.CreateCronEntries()
+// }
 
-// start the msfprc daemon (serves the Metasploit API)
-func (daemon *Daemon) StartMsfRPCd() {
-}
+// // start the msfprc daemon (serves the Metasploit API)
+// func (daemon *Daemon) StartMsfRPCd() {
+// }
 
-// serve html
-func (daemon *Daemon) CreateWebserver() {
-}
+// // serve html
+// func (daemon *Daemon) CreateWebserver() {
+// }
 
-// read database at regular intervals and send emails if needed
-func (daemon *Daemon) CreateNotifier() {
-}
+// // read database at regular intervals and send emails if needed
+// func (daemon *Daemon) CreateNotifier() {
+// }
+
+// // update msf at regular intervals and search modules for keywords and send emails if needed
+// func (daemon *Daemon) CreateUpdaterNotifier() {
+// }
 
 func main() {
 	daemon := NewDaemon()
 
 	// Flags
-	daemon.configDir = *flag.StringP("config-dir", "c", "host.d", "Directory to watch for config files.")
-	daemon.modulesFile = *flag.StringP("modules-file", "m", "modules.yml", "File to read service-to-modules mapping.")
+	configFile := *flag.StringP("config-file", "c", "sploit.yml",
+		"File to read sploit settings.")
 	flag.Usage = func() {
 		fmt.Printf("Usage:\n")
 		flag.PrintDefaults()
 	}
+
+	_, err := os.Stat(configFile)
+	fileExists := !os.IsNotExist(err)
+
 	flag.Parse()
-	// TODO error properly if host.d directory doesn't exist
-	// if flag.NFlag() != 1 {
-	// 	flag.Usage()
-	// 	return
-	// }
+	switch {
+	case flag.NFlag() == 0:
+		if !fileExists {
+			flag.Usage()
+			return
+		}
+	case flag.NFlag() == 1:
+		if !fileExists {
+			log.Fatalf("File %s not found!", configFile)
+		}
+	default:
+		log.Fatal("Wrong number of arguements; 0 or 1.")
+	}
 
 	daemon.CreateWaitGroup()
 	daemon.CreateInterruptChan()
-	daemon.LoadModuleMappings()
-	daemon.CreateModuleMappingsWatcher()
+	daemon.LoadSploitYaml(configFile)
+	daemon.LoadModulesYaml()
 	daemon.LoadHostYamls()
+	daemon.API = msfapi.New(daemon.config.MsfApiUri)
 	daemon.CreateCronDaemon()
+	// daemon.StartMsfRPCd()
 	daemon.CreateCronEntries()
-	daemon.CreateHostDotDWatcher()
-	daemon.StartMsfRPCd() // TODO can we even do this?
-	daemon.cron.Start()   // Actually start the cron daemon
-	daemon.CreateWebserver()
-	daemon.CreateNotifier()
+	// daemon.CreateWatcher()
+	daemon.cron.Start() // Actually start the cron daemon
+	// daemon.CreateWebserver()
+	// daemon.CreateNotifier()
+	// daemon.CreateUpdaterNotifier()
 	daemon.waitGroup.Wait() // Stay running until wg.Done() is called
 }

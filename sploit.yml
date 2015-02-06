@@ -1,0 +1,6 @@
+# Restart Sploit if you change this file
+msfapiuri: "http://localhost:3790/api/1.0"
+username: "admin"
+password: "mypass"
+watchdir: "host.d"
+modulesfile: "modules.yml"

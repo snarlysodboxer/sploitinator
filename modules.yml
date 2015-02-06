@@ -1,39 +1,47 @@
-services:
-  - name: ssh
-    modules:
-    - name: "auxiliary/ssh/blah"
-      options: "SSL_VERSION => SSL3"
-      pluralhosts: false
-      cronspec: "30 * * * *"
-    - name: "auxiliary/ssh/blahdittyblah"
-      options: ""
-      pluralhosts: false
-      cronspec: "30 * * * *"
+- name: ssh
+  modules:
+  - name: "auxiliary/scanner/http/ssl_version"
+    type: "auxiliary"
+    options:
+      SSL_VERSION: "SSL3"
+    cronspec: "@every 15s"
+  - name: "auxiliary/ssh/blahdittyblah"
+    type: "auxiliary"
+    options:
+      asdf: "that"
+    cronspec: "30 * * * *"
 
-  - name: nginx
-    modules:
-    - name: "auxiliary/nginx/testing123"
-      options: ""
-      pluralhosts: true
-      cronspec: "30 * * * *"
+- name: nginx
+  modules:
+  - name: "auxiliary/nginx/testing123"
+    type: "auxiliary"
+    options:
+      THIS: "that"
+    cronspec: "30 * * * *"
 
-  - name: nginxssl
-    modules:
-    - name: "auxiliary/nginxssl/ssl"
-      options: "SSL_VERSION => SSL3"
-      pluralhosts: false
-      cronspec: "30 * * * *"
+- name: nginxssl
+  modules:
+  - name: "auxiliary/nginxssl/ssl"
+    type: "auxiliary"
+    options:
+      SSL_VERSION: "SSL3"
+      changeS: "that"
+    cronspec: "30 * * * *"
 
-  - name: rails
-    modules:
-    - name: "auxiliary/rails/railsssl"
-      options: "SSL_VERSION => SSL3"
-      pluralhosts: true
-      cronspec: "30 * * * *"
+- name: rails
+  modules:
+  - name: "auxiliary/rails/railsssl"
+    type: "auxiliary"
+    options:
+      SSL_VERSION: "SSL3"
+      blah: "that"
+    cronspec: "30 * * * *"
 
-  - name: postgres
-    modules:
-    - name: "auxiliary/postgres/blahello"
-      options: "SSL_VERSION => SSL3"
-      pluralhosts: false
-      cronspec: "30 * * * *"
+- name: postgres
+  modules:
+  - name: "auxiliary/postgres/blahello"
+    type: "auxiliary"
+    options:
+      SSL_VERSION: "SSL3"
+      THIS: "that"
+    cronspec: "30 * * * *"
