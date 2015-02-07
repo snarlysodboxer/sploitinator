@@ -12,6 +12,8 @@ import (
 	"os"
 	"os/signal"
 	"regexp"
+	"strconv"
+	"strings"
 	"sync"
 	"syscall"
 	"time"
@@ -53,11 +55,6 @@ type Daemon struct {
 	cron          cron.Cron
 	waitGroup     sync.WaitGroup
 	config        config
-}
-
-// initialize a Daemon
-func NewDaemon() *Daemon {
-	return &Daemon{}
 }
 
 // supply a mechanism for staying running
@@ -139,6 +136,35 @@ func (daemon *Daemon) LoadHostYamls() {
 	log.Info("Successfully loaded hosts yaml files")
 }
 
+func (daemon *Daemon) SetupAPIToken() {
+	tempToken, err := daemon.API.AuthLogin(daemon.config.Username, daemon.config.Password)
+	if err != nil {
+		log.Fatal(err)
+	}
+	daemon.API.Token = tempToken
+	log.Debug("Got temp auth token: %v", tempToken)
+
+	permToken := strings.Replace(tempToken, "TEMP", "PERM", -1)
+	err = daemon.API.AuthTokenAdd(permToken)
+	if err != nil {
+		log.Fatal(err)
+	}
+	daemon.API.Token = permToken
+	log.Debug("Set permanent auth token: %v", permToken)
+
+	err = daemon.API.AuthTokenRemove(tempToken)
+	if err != nil {
+		log.Fatal(err)
+	}
+	log.Debug("Removed temporary auth token: %v", tempToken)
+
+	tokens, err := daemon.API.AuthTokenList()
+	if err != nil {
+		log.Fatal(err)
+	}
+	log.Debug("Current Token list: %v", tokens)
+}
+
 // create cron daemon
 func (daemon *Daemon) CreateCronDaemon() {
 	cron := cron.New()
@@ -158,44 +184,51 @@ func (daemon *Daemon) CreateCronEntries() {
 
 // to be run by cron
 func (daemon *Daemon) runModule(serviceName string, module module) {
+	// TODO need mechanism to log and return immediately if cron is still running from last initiation
 	log.Debug("Setting up this module: '%v'", module)
 	for _, host := range daemon.Hosts {
 		for _, hostService := range host.Services {
 			if hostService.Name == serviceName {
-				for _, port := range hostService.Ports {
-					log.Debug("Setting up service '%s' on port '%d' on '%v' with module %v", serviceName, port, host.Name, module)
-					daemon.apiModuleExecute(host.Name, port, module)
-				}
+				daemon.apiModuleExecuteAndWait(host.Name, hostService.Ports, module)
 			}
 		}
 	}
 }
 
-func (daemon *Daemon) apiModuleExecute(host string, port int, module module) {
-	err := daemon.API.AuthLogin(daemon.config.Username, daemon.config.Password)
-	if err != nil {
-		log.Fatal(err)
-	}
+func (daemon *Daemon) apiModuleExecuteAndWait(host string, ports []int, module module) {
+	for _, port := range ports {
+		options := make(map[string]interface{})
+		for key, value := range module.Options {
+			options[key] = value
+		}
+		options["RHOSTS"] = host
+		options["RHOST"] = host
+		options["RPORT"] = port
+		jobID, err := daemon.API.ModuleExecute(module.Type, module.Name, options)
+		if err != nil {
+			log.Fatal(err)
+		}
+		log.Info("Initiated '%s' to run against port '%d' on '%v' with job id %v.",
+			module.Name, port, host, jobID)
+		log.Debug("Module details: %v %v", module.Name, options)
 
-	options := make(map[string]interface{})
-	for key, value := range module.Options {
-		options[key] = value
+		// TODO maybe don't loop forever? timeout?
+		stillRunning := true
+		for stillRunning {
+			jobs, err := daemon.API.JobList()
+			if err != nil {
+				log.Error(err.Error())
+			}
+			log.Debug("The currently scheduled jobs are %v", jobs)
+			if jobs[strconv.FormatInt(jobID, 10)] != "" {
+				log.Debug("Job %v is still running, sleeping for 3 seconds", jobID)
+				time.Sleep(3 * time.Second)
+			} else {
+				log.Info("Job %v is done", jobID)
+				stillRunning = false
+			}
+		}
 	}
-	options["RHOSTS"] = host
-	options["RHOST"] = host
-	options["RPORT"] = port
-	log.Debug("Executing module %v %v %v", module.Type, module.Name, options)
-	jobID, err := daemon.API.ModuleExecute(module.Type, module.Name, options)
-	if err != nil {
-		log.Fatal(err)
-	}
-	log.Info("Initiated module execution with job id %v.", jobID)
-
-	err = daemon.API.AuthLogout()
-	if err != nil {
-		log.Fatal(err)
-	}
-	log.Debug("Successfully logged out.")
 }
 
 // remove all cron daemon entries
@@ -218,13 +251,15 @@ func (daemon *Daemon) CreateWatchers() {
 	done := make(chan bool)
 	timer := time.NewTimer(0 * time.Second)
 	<-timer.C //empty the channel
+	var event string
 
 	go func() {
 		for {
 			select {
-			case event := <-watcher.Events:
+			case evnt := <-watcher.Events:
 				timer.Reset(3 * time.Second)
-				log.Debug("Reset timer for event: %v", event)
+				log.Debug("Reset timer for event: %v", evnt)
+				event = evnt.Name
 			case err := <-watcher.Errors:
 				log.Fatalf("error:", err)
 			}
@@ -235,7 +270,7 @@ func (daemon *Daemon) CreateWatchers() {
 		for {
 			select {
 			case <-timer.C:
-				log.Info("Reloading configuration")
+				log.Info("Reloading configuration after %v write", event)
 				daemon.RemoveCronEntries()
 				daemon.LoadModulesYaml()
 				daemon.LoadHostYamls()
@@ -277,12 +312,11 @@ var logFormat = logging.MustStringFormatter(
 )
 
 func main() {
-	daemon := NewDaemon()
-
+	// Logging
 	logBackend := logging.NewLogBackend(os.Stderr, "", 0)
 	logBackendFormatter := logging.NewBackendFormatter(logBackend, logFormat)
 	logBackendLeveled := logging.AddModuleLevel(logBackendFormatter)
-	// Mechanism for debug logging
+	//// Mechanism for debug logging
 	if os.Getenv("DEBUG") == "true" {
 		logBackendLeveled.SetLevel(logging.DEBUG, "sploit")
 	} else {
@@ -297,10 +331,8 @@ func main() {
 		fmt.Printf("Usage:\n")
 		flag.PrintDefaults()
 	}
-
 	_, err := os.Stat(configFile)
 	fileExists := !os.IsNotExist(err)
-
 	flag.Parse()
 	switch {
 	case flag.NFlag() == 0:
@@ -316,12 +348,15 @@ func main() {
 		log.Fatal("Wrong number of arguements; 0 or 1.")
 	}
 
+	// Do it already
+	daemon := &Daemon{}
 	daemon.CreateWaitGroup()
 	daemon.CreateInterruptChan()
 	daemon.LoadSploitYaml(configFile)
 	daemon.LoadModulesYaml()
 	daemon.LoadHostYamls()
 	daemon.API = msfapi.New(daemon.config.MsfApiUri)
+	daemon.SetupAPIToken()
 	daemon.CreateCronDaemon()
 	// daemon.StartMsfRPCd()
 	daemon.CreateCronEntries()
