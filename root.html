@@ -1,0 +1,14 @@
+<h1>Sploit</h1>
+
+<h2>Cron Entries</h2>
+{{range .}}
+  <div style="border:2px solid #a1a1a1; border-radius:25px; padding:10px 40px 10px 40px; background:#dddddd;" >
+    <ul>
+      <li>{{printf "ID: %v" .ID}}</li>
+      <li>{{printf "Schedule: %v" .Schedule}}</li>
+      <li>{{printf "Next scheduled run time: %v" .Next}}</li>
+      <li>{{printf "Previous scheduled run time: %v" .Prev}}</li>
+      <li>{{printf "Job: %v" .Job}}</li>
+    </ul>
+  </div>
+{{end}}

@@ -2,13 +2,16 @@ package main
 
 import (
 	"fmt"
+	auth "github.com/abbot/go-http-auth"
 	flag "github.com/ogier/pflag"
 	"github.com/op/go-logging"
 	"github.com/snarlysodboxer/msfapi"
 	"gopkg.in/fsnotify.v1"
 	"gopkg.in/robfig/cron.v2"
 	"gopkg.in/yaml.v2"
+	"html/template"
 	"io/ioutil"
+	"net/http"
 	"os"
 	"os/signal"
 	"regexp"
@@ -20,11 +23,12 @@ import (
 )
 
 type config struct {
-	MsfApiUri   string
-	Username    string
-	Password    string
-	WatchDir    string
-	ModulesFile string
+	MsfApiUri    string
+	Username     string
+	Password     string
+	WatchDir     string
+	ModulesFile  string
+	ServeAddress string
 }
 
 type module struct {
@@ -70,8 +74,13 @@ func (daemon *Daemon) CreateInterruptChan() {
 	go func() {
 		for _ = range daemon.interruptChan {
 			log.Info("Closing....")
-			daemon.cron.Stop() // Stop the scheduler (does not stop any jobs already running).
-			defer daemon.waitGroup.Done()
+			daemon.cron.Stop()                                  // Stop the scheduler (does not stop any jobs already running).
+			err := daemon.API.AuthTokenRemove(daemon.API.Token) // essentially logout
+			if err != nil {
+				log.Fatal(err)
+			}
+			log.Debug("Removed auth token %v", daemon.API.Token)
+			daemon.waitGroup.Done()
 			os.Exit(0)
 		}
 	}()
@@ -89,8 +98,8 @@ func (daemon *Daemon) LoadSploitYaml(configFile string) {
 		log.Fatal(err)
 	}
 	daemon.config = config
-	log.Debug("Sploit yaml config is %v", config)
 	log.Info("Successfully loaded Sploit yaml file")
+	log.Debug("Sploit config is %v", config)
 }
 
 // read modules.yml and map service names to Metasploit modules
@@ -106,6 +115,7 @@ func (daemon *Daemon) LoadModulesYaml() {
 	}
 	daemon.Services = services // overwrite old
 	log.Info("Successfully loaded modules yaml file")
+	log.Debug("Modules config is: %v", services)
 }
 
 // read host.yml files from host.d into daemon.Hosts
@@ -134,6 +144,7 @@ func (daemon *Daemon) LoadHostYamls() {
 	}
 	daemon.Hosts = hosts // overwrite old
 	log.Info("Successfully loaded hosts yaml files")
+	log.Debug("Host configs are: %v", hosts)
 }
 
 func (daemon *Daemon) SetupAPIToken() {
@@ -185,7 +196,6 @@ func (daemon *Daemon) CreateCronEntries() {
 // to be run by cron
 func (daemon *Daemon) runModule(serviceName string, module module) {
 	// TODO need mechanism to log and return immediately if cron is still running from last initiation
-	log.Debug("Setting up this module: '%v'", module)
 	for _, host := range daemon.Hosts {
 		for _, hostService := range host.Services {
 			if hostService.Name == serviceName {
@@ -242,61 +252,75 @@ func (daemon *Daemon) RemoveCronEntries() {
 
 // watch modules.yml file and host.d dir and recreate all cron entries upon changes
 func (daemon *Daemon) CreateWatchers() {
-	watcher, err := fsnotify.NewWatcher()
-	if err != nil {
-		log.Fatal(err)
-	}
-	defer watcher.Close()
-
-	done := make(chan bool)
-	timer := time.NewTimer(0 * time.Second)
-	<-timer.C //empty the channel
-	var event string
-
 	go func() {
-		for {
-			select {
-			case evnt := <-watcher.Events:
-				timer.Reset(3 * time.Second)
-				log.Debug("Reset timer for event: %v", evnt)
-				event = evnt.Name
-			case err := <-watcher.Errors:
-				log.Fatalf("error:", err)
-			}
+		watcher, err := fsnotify.NewWatcher()
+		if err != nil {
+			log.Fatal(err)
 		}
-	}()
+		defer watcher.Close()
 
-	go func() {
-		for {
-			select {
-			case <-timer.C:
-				log.Info("Reloading configuration after %v write", event)
-				daemon.RemoveCronEntries()
-				daemon.LoadModulesYaml()
-				daemon.LoadHostYamls()
-				daemon.CreateCronEntries()
+		done := make(chan bool)
+		timer := time.NewTimer(0 * time.Second)
+		<-timer.C //empty the channel
+		var event string
+
+		go func() {
+			for {
+				select {
+				case evnt := <-watcher.Events:
+					timer.Reset(3 * time.Second)
+					log.Debug("Reset timer for event: %v", evnt)
+					event = evnt.Name
+				case err := <-watcher.Errors:
+					log.Fatalf("error:", err)
+				}
 			}
-		}
-	}()
+		}()
 
-	err = watcher.Add(daemon.config.WatchDir)
-	if err != nil {
-		log.Fatal(err)
-	}
-	err = watcher.Add(daemon.config.ModulesFile)
-	if err != nil {
-		log.Fatal(err)
-	}
-	<-done
+		go func() {
+			for {
+				select {
+				case <-timer.C:
+					log.Info("Reloading configuration after %v write", event)
+					daemon.RemoveCronEntries()
+					daemon.LoadModulesYaml()
+					daemon.LoadHostYamls()
+					daemon.CreateCronEntries()
+				}
+			}
+		}()
+
+		err = watcher.Add(daemon.config.WatchDir)
+		if err != nil {
+			log.Fatal(err)
+		}
+		err = watcher.Add(daemon.config.ModulesFile)
+		if err != nil {
+			log.Fatal(err)
+		}
+		<-done
+	}()
 }
 
 // // start the msfprc daemon (serves the Metasploit API)
 // func (daemon *Daemon) StartMsfRPCd() {
 // }
 
-// // serve html
-// func (daemon *Daemon) CreateWebserver() {
-// }
+// serve html
+func (daemon *Daemon) CreateWebserver() {
+	authenticator := daemon.loadDigestAuth("Sploit")
+	http.HandleFunc("/", auth.JustCheck(&authenticator, daemon.rootHandler))
+	go func() {
+		http.ListenAndServe(daemon.config.ServeAddress, nil)
+	}()
+	log.Info("Started webserver on %v", daemon.config.ServeAddress)
+}
+
+func (daemon *Daemon) rootHandler(writer http.ResponseWriter, request *http.Request) {
+	entries := daemon.cron.Entries()
+	tmpl := template.Must(template.ParseFiles("root.html"))
+	tmpl.Execute(writer, entries)
+}
 
 // // read database at regular intervals and send emails if needed
 // func (daemon *Daemon) CreateNotifier() {
@@ -362,7 +386,7 @@ func main() {
 	daemon.CreateCronEntries()
 	daemon.cron.Start()
 	daemon.CreateWatchers()
-	// daemon.CreateWebserver()
+	daemon.CreateWebserver()
 	// daemon.CreateNotifier()
 	// daemon.CreateUpdaterNotifier()
 	daemon.waitGroup.Wait() // Stay running until wg.Done() is called
