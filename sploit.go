@@ -32,10 +32,10 @@ type config struct {
 }
 
 type module struct {
-	Type     string
 	Name     string
-	Options  map[string]interface{}
+	Commands []string
 	CronSpec string
+	Running  bool
 }
 
 type host struct {
@@ -59,6 +59,45 @@ type Daemon struct {
 	cron          cron.Cron
 	waitGroup     sync.WaitGroup
 	config        config
+	configFile    string
+}
+
+func (daemon *Daemon) SetupLogging() {
+	logBackend := logging.NewLogBackend(os.Stderr, "", 0)
+	logBackendFormatter := logging.NewBackendFormatter(logBackend, logFormat)
+	logBackendLeveled := logging.AddModuleLevel(logBackendFormatter)
+	//// Mechanism for debug logging
+	if os.Getenv("DEBUG") == "true" {
+		logBackendLeveled.SetLevel(logging.DEBUG, "sploit")
+	} else {
+		logBackendLeveled.SetLevel(logging.INFO, "sploit")
+	}
+	logging.SetBackend(logBackendLeveled)
+}
+
+func (daemon *Daemon) LoadFlags() {
+	daemon.configFile = *flag.StringP("config-file", "c", "sploit.yml",
+		"File to read Sploit settings.")
+	flag.Usage = func() {
+		fmt.Printf("Usage:\n")
+		flag.PrintDefaults()
+	}
+	_, err := os.Stat(daemon.configFile)
+	fileExists := !os.IsNotExist(err)
+	flag.Parse()
+	switch {
+	case flag.NFlag() == 0:
+		if !fileExists {
+			flag.Usage()
+			return
+		}
+	case flag.NFlag() == 1:
+		if !fileExists {
+			log.Fatalf("File %s not found!", daemon.configFile)
+		}
+	default:
+		log.Fatal("Wrong number of arguements; 0 or 1.")
+	}
 }
 
 // supply a mechanism for staying running
@@ -68,7 +107,7 @@ func (daemon *Daemon) CreateWaitGroup() {
 }
 
 // supply a mechanism for stopping
-func (daemon *Daemon) CreateInterruptChan() {
+func (daemon *Daemon) CreateInterruptChannel() {
 	daemon.interruptChan = make(chan os.Signal, 1)
 	signal.Notify(daemon.interruptChan, os.Interrupt, syscall.SIGTERM)
 	go func() {
@@ -87,8 +126,8 @@ func (daemon *Daemon) CreateInterruptChan() {
 }
 
 // read sploit.yml and set settings
-func (daemon *Daemon) LoadSploitYaml(configFile string) {
-	contents, err := ioutil.ReadFile(configFile)
+func (daemon *Daemon) LoadSploitYaml() {
+	contents, err := ioutil.ReadFile(daemon.configFile)
 	if err != nil {
 		log.Fatal(err)
 	}
@@ -187,58 +226,95 @@ func (daemon *Daemon) CreateCronEntries() {
 	for _, daemonService := range daemon.Services {
 		for _, module := range daemonService.Modules {
 			log.Info("Creating a cron entry for: %v", module.Name)
-			daemon.cron.AddFunc(module.CronSpec, func() { daemon.runModule(daemonService.Name, module) })
+			module.Running = false
+			_, err := daemon.cron.AddFunc(module.CronSpec, func() {
+				daemon.apiModuleExecuteAndWait(daemonService.Name, &module)
+			})
+			if err != nil {
+				log.Fatal(err)
+			}
 			daemon.waitGroup.Add(1)
 		}
 	}
 }
 
 // to be run by cron
-func (daemon *Daemon) runModule(serviceName string, module module) {
-	// TODO need mechanism to log and return immediately if cron is still running from last initiation
+func (daemon *Daemon) apiModuleExecuteAndWait(serviceName string, module *module) {
+	if module.Running {
+		log.Warning("Module %v is already running, not running again.", module.Name)
+		return
+	} else {
+		log.Debug("Module %v is not running, continuing.", module.Name)
+	}
+	module.Running = true
 	for _, host := range daemon.Hosts {
 		for _, hostService := range host.Services {
 			if hostService.Name == serviceName {
-				daemon.apiModuleExecuteAndWait(host.Name, hostService.Ports, module)
+				for _, port := range hostService.Ports {
+					console, err := daemon.API.ConsoleCreate()
+					if err != nil {
+						module.Running = false
+						log.Fatal(err)
+					}
+					log.Debug("New console allocated: %v", console)
+
+					_, err = daemon.API.ConsoleRead(console.ID)
+					if err != nil {
+						module.Running = false
+						log.Fatal(err)
+					}
+					log.Debug("Discarded console banner.")
+
+					var commands []string
+					for _, command := range module.Commands {
+						cmd := strings.Replace(command, "SPLOITHOSTNAME", host.Name, -1)
+						cmd = strings.Replace(cmd, "SPLOITHOSTPORT", strconv.Itoa(port), -1)
+						cmd = fmt.Sprintf("%s\n", cmd)
+						commands = append(commands, cmd)
+					}
+
+					log.Info("Initiating '%s' to run against port '%d' on '%v'.",
+						module.Name, port, host.Name)
+					log.Debug("Module details: %v", module)
+					log.Debug("Commands that will be run:\n%v", commands)
+					for _, command := range commands {
+						err = daemon.API.ConsoleWrite(console.ID, command)
+						if err != nil {
+							module.Running = false
+							log.Fatal(err)
+						}
+						log.Debug("Wrote '%#v' to console %v", command, console.ID)
+						// don't read too soon or you get blank response
+						time.Sleep(750 * time.Millisecond)
+						// TODO maybe don't loop forever? timeout?
+						busy := true
+						for busy {
+							response, err := daemon.API.ConsoleRead(console.ID)
+							if err != nil {
+								module.Running = false
+								log.Fatal(err)
+							}
+							log.Debug("Read console %v output:\n%v", console.ID, response.Data)
+							if response.Busy {
+								log.Debug("Console %v is still busy, sleeping 3 seconds..", console.ID)
+								time.Sleep(3 * time.Second)
+							} else {
+								busy = false
+							}
+						}
+					}
+
+					err = daemon.API.ConsoleDestroy(console.ID)
+					if err != nil {
+						module.Running = false
+						log.Fatal(err)
+					}
+					log.Debug("Successfullly removed console %v", console)
+				}
 			}
 		}
 	}
-}
-
-func (daemon *Daemon) apiModuleExecuteAndWait(host string, ports []int, module module) {
-	for _, port := range ports {
-		options := make(map[string]interface{})
-		for key, value := range module.Options {
-			options[key] = value
-		}
-		options["RHOSTS"] = host
-		options["RHOST"] = host
-		options["RPORT"] = port
-		jobID, err := daemon.API.ModuleExecute(module.Type, module.Name, options)
-		if err != nil {
-			log.Fatal(err)
-		}
-		log.Info("Initiated '%s' to run against port '%d' on '%v' with job id %v.",
-			module.Name, port, host, jobID)
-		log.Debug("Module details: %v %v", module.Name, options)
-
-		// TODO maybe don't loop forever? timeout?
-		stillRunning := true
-		for stillRunning {
-			jobs, err := daemon.API.JobList()
-			if err != nil {
-				log.Error(err.Error())
-			}
-			log.Debug("The currently scheduled jobs are %v", jobs)
-			if jobs[strconv.FormatInt(jobID, 10)] != "" {
-				log.Debug("Job %v is still running, sleeping for 3 seconds", jobID)
-				time.Sleep(3 * time.Second)
-			} else {
-				log.Info("Job %v is done", jobID)
-				stillRunning = false
-			}
-		}
-	}
+	module.Running = false
 }
 
 // remove all cron daemon entries
@@ -324,6 +400,10 @@ func (daemon *Daemon) rootHandler(writer http.ResponseWriter, request *http.Requ
 
 // // read database at regular intervals and send emails if needed
 // func (daemon *Daemon) CreateNotifier() {
+// run separate cron daemon for checking regularly
+// check with an sql statement
+// keep track of vulnerabilites in memory by database created_at column
+// email when there are new vulnerabilites
 // }
 
 // // update msf at regular intervals and search modules for keywords and send emails if needed
@@ -336,47 +416,13 @@ var logFormat = logging.MustStringFormatter(
 )
 
 func main() {
-	// Logging
-	logBackend := logging.NewLogBackend(os.Stderr, "", 0)
-	logBackendFormatter := logging.NewBackendFormatter(logBackend, logFormat)
-	logBackendLeveled := logging.AddModuleLevel(logBackendFormatter)
-	//// Mechanism for debug logging
-	if os.Getenv("DEBUG") == "true" {
-		logBackendLeveled.SetLevel(logging.DEBUG, "sploit")
-	} else {
-		logBackendLeveled.SetLevel(logging.INFO, "sploit")
-	}
-	logging.SetBackend(logBackendLeveled)
-
-	// Flags
-	configFile := *flag.StringP("config-file", "c", "sploit.yml",
-		"File to read Sploit settings.")
-	flag.Usage = func() {
-		fmt.Printf("Usage:\n")
-		flag.PrintDefaults()
-	}
-	_, err := os.Stat(configFile)
-	fileExists := !os.IsNotExist(err)
-	flag.Parse()
-	switch {
-	case flag.NFlag() == 0:
-		if !fileExists {
-			flag.Usage()
-			return
-		}
-	case flag.NFlag() == 1:
-		if !fileExists {
-			log.Fatalf("File %s not found!", configFile)
-		}
-	default:
-		log.Fatal("Wrong number of arguements; 0 or 1.")
-	}
-
 	// Do it already
 	daemon := &Daemon{}
+	daemon.SetupLogging()
+	daemon.LoadFlags()
 	daemon.CreateWaitGroup()
-	daemon.CreateInterruptChan()
-	daemon.LoadSploitYaml(configFile)
+	daemon.CreateInterruptChannel()
+	daemon.LoadSploitYaml()
 	daemon.LoadModulesYaml()
 	daemon.LoadHostYamls()
 	daemon.API = msfapi.New(daemon.config.MsfApiUri)
