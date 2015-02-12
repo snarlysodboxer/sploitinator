@@ -1,8 +1,10 @@
 package main
 
 import (
+	"database/sql"
 	"fmt"
 	auth "github.com/abbot/go-http-auth"
+	_ "github.com/lib/pq"
 	flag "github.com/ogier/pflag"
 	"github.com/op/go-logging"
 	"github.com/snarlysodboxer/msfapi"
@@ -11,7 +13,9 @@ import (
 	"gopkg.in/yaml.v2"
 	"html/template"
 	"io/ioutil"
+	"net"
 	"net/http"
+	"net/smtp"
 	"os"
 	"os/signal"
 	"regexp"
@@ -22,13 +26,38 @@ import (
 	"time"
 )
 
-type config struct {
-	MsfApiUri    string
-	Username     string
-	Password     string
+type msfConfig struct {
+	URI  string
+	User string
+	Pass string
+}
+
+type sploitConfig struct {
 	WatchDir     string
 	ModulesFile  string
 	ServeAddress string
+}
+
+type postgresConfig struct {
+	DB   string
+	User string
+	Host string
+	Port string
+}
+
+type smtpConfig struct {
+	User string
+	Pass string
+	Host string
+	From string
+	To   string
+}
+
+type config struct {
+	Sploit   sploitConfig
+	MsfRpc   msfConfig
+	Postgres postgresConfig
+	SMTP     smtpConfig
 }
 
 type module struct {
@@ -56,10 +85,13 @@ type Daemon struct {
 	Services      []service
 	API           *msfapi.API
 	interruptChan chan os.Signal
+	notifierChan  chan bool
 	cron          cron.Cron
 	waitGroup     sync.WaitGroup
-	config        config
+	cfg           config
 	configFile    string
+	db            sql.DB
+	knownVulns    []int
 }
 
 func (daemon *Daemon) SetupLogging() {
@@ -100,12 +132,6 @@ func (daemon *Daemon) LoadFlags() {
 	}
 }
 
-// supply a mechanism for staying running
-func (daemon *Daemon) CreateWaitGroup() {
-	var wg sync.WaitGroup
-	daemon.waitGroup = wg
-}
-
 // supply a mechanism for stopping
 func (daemon *Daemon) CreateInterruptChannel() {
 	daemon.interruptChan = make(chan os.Signal, 1)
@@ -119,6 +145,7 @@ func (daemon *Daemon) CreateInterruptChannel() {
 				log.Fatal(err)
 			}
 			log.Debug("Removed auth token %v", daemon.API.Token)
+			defer daemon.db.Close()
 			daemon.waitGroup.Done()
 			os.Exit(0)
 		}
@@ -131,19 +158,19 @@ func (daemon *Daemon) LoadSploitYaml() {
 	if err != nil {
 		log.Fatal(err)
 	}
-	config := config{}
-	err = yaml.Unmarshal([]byte(contents), &config)
+	cfg := config{}
+	err = yaml.Unmarshal([]byte(contents), &cfg)
 	if err != nil {
 		log.Fatal(err)
 	}
-	daemon.config = config
+	daemon.cfg = cfg
 	log.Info("Successfully loaded Sploit yaml file")
-	log.Debug("Sploit config is %v", config)
+	log.Debug("Sploit config is %v", cfg)
 }
 
 // read modules.yml and map service names to Metasploit modules
 func (daemon *Daemon) LoadModulesYaml() {
-	contents, err := ioutil.ReadFile(daemon.config.ModulesFile)
+	contents, err := ioutil.ReadFile(daemon.cfg.Sploit.ModulesFile)
 	if err != nil {
 		log.Fatal(err)
 	}
@@ -159,7 +186,7 @@ func (daemon *Daemon) LoadModulesYaml() {
 
 // read host.yml files from host.d into daemon.Hosts
 func (daemon *Daemon) LoadHostYamls() {
-	files, err := ioutil.ReadDir(fmt.Sprintf("./%s", daemon.config.WatchDir))
+	files, err := ioutil.ReadDir(fmt.Sprintf("./%s", daemon.cfg.Sploit.WatchDir))
 	if err != nil {
 		log.Fatal(err)
 	}
@@ -168,7 +195,7 @@ func (daemon *Daemon) LoadHostYamls() {
 		if !file.IsDir() {
 			regex := regexp.MustCompilePOSIX(".*.yml$")
 			if regex.MatchString(file.Name()) {
-				contents, err := ioutil.ReadFile(fmt.Sprintf("%s/%s", daemon.config.WatchDir, file.Name()))
+				contents, err := ioutil.ReadFile(fmt.Sprintf("%s/%s", daemon.cfg.Sploit.WatchDir, file.Name()))
 				if err != nil {
 					log.Fatal(err)
 				}
@@ -187,7 +214,7 @@ func (daemon *Daemon) LoadHostYamls() {
 }
 
 func (daemon *Daemon) SetupAPIToken() {
-	tempToken, err := daemon.API.AuthLogin(daemon.config.Username, daemon.config.Password)
+	tempToken, err := daemon.API.AuthLogin(daemon.cfg.MsfRpc.User, daemon.cfg.MsfRpc.Pass)
 	if err != nil {
 		log.Fatal(err)
 	}
@@ -213,6 +240,20 @@ func (daemon *Daemon) SetupAPIToken() {
 		log.Fatal(err)
 	}
 	log.Debug("Current Token list: %v", tokens)
+}
+
+func (daemon *Daemon) OpenDBConnection() {
+	cfg := daemon.cfg.Postgres
+	db, err := sql.Open("postgres",
+		fmt.Sprintf("user=%s host=%s port=%s dbname=%s sslmode=disable",
+			cfg.User, cfg.Host, cfg.Port, cfg.DB,
+		),
+	)
+	if err != nil {
+		log.Fatal(err)
+	}
+	daemon.db = *db
+	log.Info("Successfully opened a database connection")
 }
 
 // create cron daemon
@@ -244,8 +285,10 @@ func (daemon *Daemon) apiModuleExecuteAndWait(serviceName string, module *module
 		log.Warning("Module %v is already running, not running again.", module.Name)
 		return
 	} else {
-		log.Debug("Module %v is not running, continuing.", module.Name)
+		log.Info("Running cron entry for module %v", module.Name)
 	}
+	startTime := time.Now()
+	log.Debug("%v start time", module.Name)
 	module.Running = true
 	for _, host := range daemon.Hosts {
 		for _, hostService := range host.Services {
@@ -276,7 +319,7 @@ func (daemon *Daemon) apiModuleExecuteAndWait(serviceName string, module *module
 					log.Info("Initiating '%s' to run against port '%d' on '%v'.",
 						module.Name, port, host.Name)
 					log.Debug("Module details: %v", module)
-					log.Debug("Commands that will be run:\n%v", commands)
+					log.Debug("Commands that will be run:\n%#v", commands)
 					for _, command := range commands {
 						err = daemon.API.ConsoleWrite(console.ID, command)
 						if err != nil {
@@ -309,12 +352,85 @@ func (daemon *Daemon) apiModuleExecuteAndWait(serviceName string, module *module
 						module.Running = false
 						log.Fatal(err)
 					}
-					log.Debug("Successfullly removed console %v", console)
+					log.Debug("Successfully removed console %v", console)
 				}
 			}
 		}
 	}
+	log.Info("%v took %v to run", module.Name, time.Since(startTime))
+	log.Debug("%v end time", module.Name)
 	module.Running = false
+	daemon.notifierChan <- true
+}
+
+func (daemon *Daemon) CreateNotifier() {
+	daemon.notifierChan = make(chan bool, 10)
+	go func() {
+		for range daemon.notifierChan {
+			daemon.notifyIfNeeded()
+		}
+	}()
+}
+
+// read database and send emails if needed
+func (daemon *Daemon) notifyIfNeeded() {
+	// check for vulns with an sql statement
+	var (
+		id         int
+		createdAt  time.Time
+		address    string
+		name       string
+		references string
+	)
+	query := strings.Join([]string{
+		"SELECT vulns.id,vulns.created_at,hosts.address,vulns.name,array_agg(refs.name) AS references",
+		"FROM vulns,hosts,vulns_refs,refs",
+		"WHERE vulns.host_id = hosts.id AND refs.id = vulns_refs.ref_id AND vulns_refs.vuln_id = vulns.id",
+		"GROUP BY vulns.id,vulns.created_at,hosts.address,vulns.name;",
+	}, " ")
+	vulns, err := daemon.db.Query(query)
+	if err != nil {
+		log.Fatal(err)
+	}
+	defer vulns.Close()
+	for vulns.Next() {
+		err = vulns.Scan(&id, &createdAt, &address, &name, &references)
+		if err != nil {
+			log.Fatal(err)
+		}
+		log.Debug("Vulnerability found:\n%v %v %v %v", createdAt, address, name, references)
+		log.Debug("Vulnerability record ID: %v", id)
+		known := false
+		for _, vuln := range daemon.knownVulns {
+			if vuln == id {
+				known = true
+			}
+		}
+		if known {
+			log.Debug("Vulnerabilty %v is already known, not notifying", id)
+		} else {
+			var subject = fmt.Sprintf("New Vulnerability found on %s", address)
+			var message = fmt.Sprintf("Found the folowing Vulnerability found on %s\n\n%s %s %s %s",
+				address, createdAt, address, name, strings.Replace(references, ",", " ", -1),
+			)
+			const dateLayout = "Mon, 2 Jan 2006 15:04:05 -0700"
+			body := "From: " + daemon.cfg.SMTP.From + "\r\nTo: " + daemon.cfg.SMTP.To +
+				"\r\nSubject: " + subject + "\r\nDate: " + time.Now().Format(dateLayout) +
+				"\r\n\r\n" + message
+			domain, _, err := net.SplitHostPort(daemon.cfg.SMTP.Host)
+			if err != nil {
+				log.Fatalf("Error with net.SplitHostPort: %v", err)
+			}
+			auth := smtp.PlainAuth("", daemon.cfg.SMTP.User, daemon.cfg.SMTP.Pass, domain)
+			err = smtp.SendMail(daemon.cfg.SMTP.Host, auth, daemon.cfg.SMTP.From,
+				strings.Fields(daemon.cfg.SMTP.To), []byte(body))
+			if err != nil {
+				log.Fatalf("Error with smtp.SendMail: %v\n\n", err)
+				log.Fatalf("Body: %v\n\n", body)
+			}
+			daemon.knownVulns = append(daemon.knownVulns, id)
+		}
+	}
 }
 
 // remove all cron daemon entries
@@ -366,11 +482,11 @@ func (daemon *Daemon) CreateWatchers() {
 			}
 		}()
 
-		err = watcher.Add(daemon.config.WatchDir)
+		err = watcher.Add(daemon.cfg.Sploit.WatchDir)
 		if err != nil {
 			log.Fatal(err)
 		}
-		err = watcher.Add(daemon.config.ModulesFile)
+		err = watcher.Add(daemon.cfg.Sploit.ModulesFile)
 		if err != nil {
 			log.Fatal(err)
 		}
@@ -378,18 +494,14 @@ func (daemon *Daemon) CreateWatchers() {
 	}()
 }
 
-// // start the msfprc daemon (serves the Metasploit API)
-// func (daemon *Daemon) StartMsfRPCd() {
-// }
-
 // serve html
 func (daemon *Daemon) CreateWebserver() {
 	authenticator := daemon.loadDigestAuth("Sploit")
 	http.HandleFunc("/", auth.JustCheck(&authenticator, daemon.rootHandler))
 	go func() {
-		http.ListenAndServe(daemon.config.ServeAddress, nil)
+		http.ListenAndServe(daemon.cfg.Sploit.ServeAddress, nil)
 	}()
-	log.Info("Started webserver on %v", daemon.config.ServeAddress)
+	log.Info("Started webserver on %v", daemon.cfg.Sploit.ServeAddress)
 }
 
 func (daemon *Daemon) rootHandler(writer http.ResponseWriter, request *http.Request) {
@@ -398,16 +510,9 @@ func (daemon *Daemon) rootHandler(writer http.ResponseWriter, request *http.Requ
 	tmpl.Execute(writer, entries)
 }
 
-// // read database at regular intervals and send emails if needed
-// func (daemon *Daemon) CreateNotifier() {
-// run separate cron daemon for checking regularly
-// check with an sql statement
-// keep track of vulnerabilites in memory by database created_at column
-// email when there are new vulnerabilites
-// }
-
 // // update msf at regular intervals and search modules for keywords and send emails if needed
 // func (daemon *Daemon) CreateUpdaterNotifier() {
+// run separate cron daemon for checking regularly
 // }
 
 var log = logging.MustGetLogger("sploit")
@@ -419,21 +524,24 @@ func main() {
 	// Do it already
 	daemon := &Daemon{}
 	daemon.SetupLogging()
+	log.Info("Daemon starting up now")
 	daemon.LoadFlags()
-	daemon.CreateWaitGroup()
+	daemon.waitGroup = *new(sync.WaitGroup) // supply a mechanism for staying running
 	daemon.CreateInterruptChannel()
 	daemon.LoadSploitYaml()
 	daemon.LoadModulesYaml()
 	daemon.LoadHostYamls()
-	daemon.API = msfapi.New(daemon.config.MsfApiUri)
+	daemon.OpenDBConnection()
+	daemon.API = msfapi.New(daemon.cfg.MsfRpc.URI)
 	daemon.SetupAPIToken()
+	daemon.CreateNotifier()
 	daemon.CreateCronDaemon()
-	// daemon.StartMsfRPCd()
 	daemon.CreateCronEntries()
 	daemon.cron.Start()
 	daemon.CreateWatchers()
 	daemon.CreateWebserver()
-	// daemon.CreateNotifier()
+	// TODO recover from most errors
 	// daemon.CreateUpdaterNotifier()
+	// weekly status/update email
 	daemon.waitGroup.Wait() // Stay running until wg.Done() is called
 }

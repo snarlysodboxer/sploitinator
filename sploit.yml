@@ -1,7 +1,20 @@
 # Restart Sploit if you change this file
-msfapiuri: "http://localhost:3790/api/1.0"
-username: "admin"
-password: "mypass"
-watchdir: "host.d"
-modulesfile: "modules.yml"
-serveaddress: "127.0.0.1:8080"
+sploit:
+  watchdir: "host.d"
+  modulesfile: "modules.yml"
+  serveaddress: "127.0.0.1:8080"
+msfrpc:
+  uri: "http://localhost:3790/api/1.0"
+  user: "admin"
+  pass: "mypass"
+postgres:
+  db: "msf"
+  user: "postgres"
+  host: "localhost"
+  port: "5432"
+smtp:
+  user: "admin@example.com"
+  pass: "mypass"
+  host: "smtp.example.net:587"
+  from: "msf@example.com"
+  to: "admin@example.com"

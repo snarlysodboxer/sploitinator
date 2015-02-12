@@ -30,15 +30,15 @@ func loadOrCreateDigestFile(name string) *os.File {
 func (daemon *Daemon) loadDigestAuth(realm string) auth.DigestAuth {
 	file := loadOrCreateDigestFile(".sploit-digest")
 	// Setup string to hash through md5
-	bytes := []byte(daemon.config.Username)
+	bytes := []byte(daemon.cfg.MsfRpc.User)
 	bytes = append(bytes, []byte(":")...)
 	bytes = append(bytes, []byte(realm)...)
 	bytes = append(bytes, []byte(":")...)
-	bytes = append(bytes, []byte(daemon.config.Password)...)
+	bytes = append(bytes, []byte(daemon.cfg.MsfRpc.Pass)...)
 	encryptedBytePassArray := md5.Sum(bytes)
 	encryptedBytePass := encryptedBytePassArray[:]
 	// Setup bytes to write to htdigest file
-	bytes = []byte(daemon.config.Username)
+	bytes = []byte(daemon.cfg.MsfRpc.User)
 	bytes = append(bytes, []byte(":")...)
 	bytes = append(bytes, []byte(realm)...)
 	bytes = append(bytes, []byte(":")...)
