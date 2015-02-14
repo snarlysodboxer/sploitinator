@@ -1,6 +1,7 @@
 package main
 
 import (
+	"bytes"
 	"database/sql"
 	"fmt"
 	auth "github.com/abbot/go-http-auth"
@@ -12,6 +13,7 @@ import (
 	"gopkg.in/robfig/cron.v2"
 	"gopkg.in/yaml.v2"
 	"html/template"
+	"io"
 	"io/ioutil"
 	"net"
 	"net/http"
@@ -36,6 +38,10 @@ type sploitConfig struct {
 	WatchDir     string
 	ModulesFile  string
 	ServeAddress string
+	UpdateSpec   string
+	StatusSpec   string
+	LogInfo      string
+	LogDebug     string
 }
 
 type postgresConfig struct {
@@ -82,29 +88,60 @@ type service struct {
 
 type Daemon struct {
 	Hosts         []host
-	Services      []service
+	Services      *[]service
 	API           *msfapi.API
 	interruptChan chan os.Signal
 	notifierChan  chan bool
 	cron          cron.Cron
+	internalCron  cron.Cron
+	updateRunning bool
+	lastUpdate    time.Time
 	waitGroup     sync.WaitGroup
 	cfg           config
 	configFile    string
 	db            sql.DB
-	knownVulns    []int
+	knownVulnIDs  []int
+	knownModules  map[string][]string
+	scanCount     int
+	infoWriter    *os.File
+	debugWriter   *os.File
+}
+
+type vulnerability struct {
+	id         int
+	CreatedAt  time.Time
+	Address    string
+	Name       string
+	References string
 }
 
 func (daemon *Daemon) SetupLogging() {
-	logBackend := logging.NewLogBackend(os.Stderr, "", 0)
-	logBackendFormatter := logging.NewBackendFormatter(logBackend, logFormat)
-	logBackendLeveled := logging.AddModuleLevel(logBackendFormatter)
-	//// Mechanism for debug logging
+	daemon.infoWriter = loadOrCreateFile(daemon.cfg.Sploit.LogInfo)
+	var logFormatInfo = logging.MustStringFormatter(
+		"%{color}%{time:15:04:05.000} %{level:.8s} pid:%{pid} %{message}%{color:reset}",
+	)
+	multiWriter := io.MultiWriter(os.Stderr, daemon.infoWriter)
+	logBackendInfo := logging.NewLogBackend(multiWriter, "", 0)
+	logBackendFormatterInfo := logging.NewBackendFormatter(logBackendInfo, logFormatInfo)
+	logBackendLeveledInfo := logging.AddModuleLevel(logBackendFormatterInfo)
 	if os.Getenv("DEBUG") == "true" {
-		logBackendLeveled.SetLevel(logging.DEBUG, "sploit")
+		logBackendLeveledInfo.SetLevel(logging.DEBUG, "sploit")
 	} else {
-		logBackendLeveled.SetLevel(logging.INFO, "sploit")
+		logBackendLeveledInfo.SetLevel(logging.INFO, "sploit")
 	}
-	logging.SetBackend(logBackendLeveled)
+	if daemon.cfg.Sploit.LogDebug != "" {
+		daemon.debugWriter = loadOrCreateFile(daemon.cfg.Sploit.LogDebug)
+		var logFormatDebug = logging.MustStringFormatter(
+			"%{color}%{time:15:04:05.000} %{shortfunc} ▶ %{level:.4s} %{id:03x} %{message}%{color:reset}",
+		)
+		logBackendDebug := logging.NewLogBackend(daemon.debugWriter, "", 0)
+		logBackendFormatterDebug := logging.NewBackendFormatter(logBackendDebug, logFormatDebug)
+		logBackendLeveledDebug := logging.AddModuleLevel(logBackendFormatterDebug)
+		logBackendLeveledDebug.SetLevel(logging.DEBUG, "sploit")
+		logging.SetBackend(logBackendLeveledInfo, logBackendLeveledDebug)
+	} else {
+		logging.SetBackend(logBackendLeveledInfo)
+	}
 }
 
 func (daemon *Daemon) LoadFlags() {
@@ -146,8 +183,10 @@ func (daemon *Daemon) CreateInterruptChannel() {
 			}
 			log.Debug("Removed auth token %v", daemon.API.Token)
 			defer daemon.db.Close()
+			defer daemon.infoWriter.Close()
+			defer daemon.debugWriter.Close()
 			daemon.waitGroup.Done()
-			os.Exit(0)
+			// os.Exit(0)
 		}
 	}()
 }
@@ -164,8 +203,7 @@ func (daemon *Daemon) LoadSploitYaml() {
 		log.Fatal(err)
 	}
 	daemon.cfg = cfg
-	log.Info("Successfully loaded Sploit yaml file")
-	log.Debug("Sploit config is %v", cfg)
+	fmt.Println("Successfully loaded Sploit yaml file")
 }
 
 // read modules.yml and map service names to Metasploit modules
@@ -179,7 +217,7 @@ func (daemon *Daemon) LoadModulesYaml() {
 	if err != nil {
 		log.Fatal(err)
 	}
-	daemon.Services = services // overwrite old
+	daemon.Services = &services // overwrite old
 	log.Info("Successfully loaded modules yaml file")
 	log.Debug("Modules config is: %v", services)
 }
@@ -256,20 +294,14 @@ func (daemon *Daemon) OpenDBConnection() {
 	log.Info("Successfully opened a database connection")
 }
 
-// create cron daemon
-func (daemon *Daemon) CreateCronDaemon() {
-	cron := cron.New()
-	daemon.cron = *cron
-}
-
 // setup cron entries which send api calls to msfrpcd
 func (daemon *Daemon) CreateCronEntries() {
-	for _, daemonService := range daemon.Services {
+	for _, daemonService := range *daemon.Services {
 		for _, module := range daemonService.Modules {
 			log.Info("Creating a cron entry for: %v", module.Name)
 			module.Running = false
 			_, err := daemon.cron.AddFunc(module.CronSpec, func() {
-				daemon.apiModuleExecuteAndWait(daemonService.Name, &module)
+				daemon.runModuleAgainstEachHostPort(daemonService.Name, &module)
 			})
 			if err != nil {
 				log.Fatal(err)
@@ -280,7 +312,7 @@ func (daemon *Daemon) CreateCronEntries() {
 }
 
 // to be run by cron
-func (daemon *Daemon) apiModuleExecuteAndWait(serviceName string, module *module) {
+func (daemon *Daemon) runModuleAgainstEachHostPort(serviceName string, module *module) {
 	if module.Running {
 		log.Warning("Module %v is already running, not running again.", module.Name)
 		return
@@ -294,20 +326,6 @@ func (daemon *Daemon) apiModuleExecuteAndWait(serviceName string, module *module
 		for _, hostService := range host.Services {
 			if hostService.Name == serviceName {
 				for _, port := range hostService.Ports {
-					console, err := daemon.API.ConsoleCreate()
-					if err != nil {
-						module.Running = false
-						log.Fatal(err)
-					}
-					log.Debug("New console allocated: %v", console)
-
-					_, err = daemon.API.ConsoleRead(console.ID)
-					if err != nil {
-						module.Running = false
-						log.Fatal(err)
-					}
-					log.Debug("Discarded console banner.")
-
 					var commands []string
 					for _, command := range module.Commands {
 						cmd := strings.Replace(command, "SPLOITHOSTNAME", host.Name, -1)
@@ -320,39 +338,7 @@ func (daemon *Daemon) apiModuleExecuteAndWait(serviceName string, module *module
 						module.Name, port, host.Name)
 					log.Debug("Module details: %v", module)
 					log.Debug("Commands that will be run:\n%#v", commands)
-					for _, command := range commands {
-						err = daemon.API.ConsoleWrite(console.ID, command)
-						if err != nil {
-							module.Running = false
-							log.Fatal(err)
-						}
-						log.Debug("Wrote '%#v' to console %v", command, console.ID)
-						// don't read too soon or you get blank response
-						time.Sleep(750 * time.Millisecond)
-						// TODO maybe don't loop forever? timeout?
-						busy := true
-						for busy {
-							response, err := daemon.API.ConsoleRead(console.ID)
-							if err != nil {
-								module.Running = false
-								log.Fatal(err)
-							}
-							log.Debug("Read console %v output:\n%v", console.ID, response.Data)
-							if response.Busy {
-								log.Debug("Console %v is still busy, sleeping 3 seconds..", console.ID)
-								time.Sleep(3 * time.Second)
-							} else {
-								busy = false
-							}
-						}
-					}
-
-					err = daemon.API.ConsoleDestroy(console.ID)
-					if err != nil {
-						module.Running = false
-						log.Fatal(err)
-					}
-					log.Debug("Successfully removed console %v", console)
+					_ = daemon.createConsoleAndRun(commands)
 				}
 			}
 		}
@@ -360,6 +346,7 @@ func (daemon *Daemon) apiModuleExecuteAndWait(serviceName string, module *module
 	log.Info("%v took %v to run", module.Name, time.Since(startTime))
 	log.Debug("%v end time", module.Name)
 	module.Running = false
+	daemon.scanCount = daemon.scanCount + 1
 	daemon.notifierChan <- true
 }
 
@@ -367,21 +354,13 @@ func (daemon *Daemon) CreateNotifier() {
 	daemon.notifierChan = make(chan bool, 10)
 	go func() {
 		for range daemon.notifierChan {
-			daemon.notifyIfNeeded()
+			daemon.recordAndNotify()
 		}
 	}()
 }
 
-// read database and send emails if needed
-func (daemon *Daemon) notifyIfNeeded() {
-	// check for vulns with an sql statement
-	var (
-		id         int
-		createdAt  time.Time
-		address    string
-		name       string
-		references string
-	)
+// check for vulns in the database with an sql statement
+func (daemon *Daemon) selectVulns() *[]vulnerability {
 	query := strings.Join([]string{
 		"SELECT vulns.id,vulns.created_at,hosts.address,vulns.name,array_agg(refs.name) AS references",
 		"FROM vulns,hosts,vulns_refs,refs",
@@ -393,43 +372,60 @@ func (daemon *Daemon) notifyIfNeeded() {
 		log.Fatal(err)
 	}
 	defer vulns.Close()
+	vulnerabilities := []vulnerability{}
 	for vulns.Next() {
-		err = vulns.Scan(&id, &createdAt, &address, &name, &references)
+		var vuln = vulnerability{}
+		err = vulns.Scan(&vuln.id, &vuln.CreatedAt, &vuln.Address, &vuln.Name, &vuln.References)
 		if err != nil {
 			log.Fatal(err)
 		}
-		log.Debug("Vulnerability found:\n%v %v %v %v", createdAt, address, name, references)
-		log.Debug("Vulnerability record ID: %v", id)
+		vuln.References = strings.Replace(vuln.References, ",", " ", -1)
+		vuln.References = strings.Replace(vuln.References, "-http", " http", 1)
+		log.Debug("Vulnerability found:\n%v %v %v %v",
+			vuln.CreatedAt, vuln.Address, vuln.Name, vuln.References)
+		vulnerabilities = append(vulnerabilities, vuln)
+	}
+	return &vulnerabilities
+}
+
+// record vulns database IDs and send emails when new vulns are found
+func (daemon *Daemon) recordAndNotify() {
+	vulns := daemon.selectVulns()
+	for _, vuln := range *vulns {
 		known := false
-		for _, vuln := range daemon.knownVulns {
-			if vuln == id {
+		for _, vulnID := range daemon.knownVulnIDs {
+			if vulnID == vuln.id {
 				known = true
 			}
 		}
 		if known {
-			log.Debug("Vulnerabilty %v is already known, not notifying", id)
+			log.Debug("Vulnerabilty %v is already known, not notifying", vuln.id)
 		} else {
-			var subject = fmt.Sprintf("New Vulnerability found on %s", address)
-			var message = fmt.Sprintf("Found the folowing Vulnerability found on %s\n\n%s %s %s %s",
-				address, createdAt, address, name, strings.Replace(references, ",", " ", -1),
+			var subject = fmt.Sprintf("New Vulnerability found on %s", vuln.Address)
+			var message = fmt.Sprintf("Found the folowing Vulnerability on %s\n\n%s %s %s %s",
+				vuln.Address, vuln.CreatedAt, vuln.Address, vuln.Name, vuln.References,
 			)
-			const dateLayout = "Mon, 2 Jan 2006 15:04:05 -0700"
-			body := "From: " + daemon.cfg.SMTP.From + "\r\nTo: " + daemon.cfg.SMTP.To +
-				"\r\nSubject: " + subject + "\r\nDate: " + time.Now().Format(dateLayout) +
-				"\r\n\r\n" + message
-			domain, _, err := net.SplitHostPort(daemon.cfg.SMTP.Host)
-			if err != nil {
-				log.Fatalf("Error with net.SplitHostPort: %v", err)
-			}
-			auth := smtp.PlainAuth("", daemon.cfg.SMTP.User, daemon.cfg.SMTP.Pass, domain)
-			err = smtp.SendMail(daemon.cfg.SMTP.Host, auth, daemon.cfg.SMTP.From,
-				strings.Fields(daemon.cfg.SMTP.To), []byte(body))
-			if err != nil {
-				log.Fatalf("Error with smtp.SendMail: %v\n\n", err)
-				log.Fatalf("Body: %v\n\n", body)
-			}
-			daemon.knownVulns = append(daemon.knownVulns, id)
+			daemon.sendEmail(&subject, &message)
+			daemon.knownVulnIDs = append(daemon.knownVulnIDs, vuln.id)
 		}
+	}
+}
+
+func (daemon *Daemon) sendEmail(subject, message *string) {
+	const dateLayout = "Mon, 2 Jan 2006 15:04:05 -0700"
+	body := "From: " + daemon.cfg.SMTP.From + "\r\nTo: " + daemon.cfg.SMTP.To +
+		"\r\nSubject: " + *subject + "\r\nDate: " + time.Now().Format(dateLayout) +
+		"\r\n\r\n" + *message
+	domain, _, err := net.SplitHostPort(daemon.cfg.SMTP.Host)
+	if err != nil {
+		log.Fatalf("Error with net.SplitHostPort: %v", err)
+	}
+	auth := smtp.PlainAuth("", daemon.cfg.SMTP.User, daemon.cfg.SMTP.Pass, domain)
+	err = smtp.SendMail(daemon.cfg.SMTP.Host, auth, daemon.cfg.SMTP.From,
+		strings.Fields(daemon.cfg.SMTP.To), []byte(body))
+	if err != nil {
+		log.Fatalf("Error with smtp.SendMail: %v\n\n", err)
+		log.Fatalf("Body: %v\n\n", body)
 	}
 }
 
@@ -505,43 +501,225 @@ func (daemon *Daemon) CreateWebserver() {
 }
 
 func (daemon *Daemon) rootHandler(writer http.ResponseWriter, request *http.Request) {
-	entries := daemon.cron.Entries()
+	var data struct {
+		CronEntries []cron.Entry
+		Vulns       []vulnerability
+	}
+	data.CronEntries = daemon.cron.Entries()
+	data.Vulns = *daemon.selectVulns()
 	tmpl := template.Must(template.ParseFiles("root.html"))
-	tmpl.Execute(writer, entries)
+	tmpl.Execute(writer, &data)
 }
 
-// // update msf at regular intervals and search modules for keywords and send emails if needed
-// func (daemon *Daemon) CreateUpdaterNotifier() {
-// run separate cron daemon for checking regularly
-// }
+// run separate cron daemon to update msf at regular intervals
+func (daemon *Daemon) CreateUpdaterNotifier() {
+	daemon.internalCron = *cron.New()
+	daemon.updateRunning = false
+	_, err := daemon.internalCron.AddFunc(daemon.cfg.Sploit.UpdateSpec, daemon.updateMsf)
+	if err != nil {
+		log.Fatal(err)
+	}
+	log.Debug("Setup to git pull on this schedule '%v'", daemon.cfg.Sploit.UpdateSpec)
+	daemon.internalCron.Start()
+}
+
+func (daemon *Daemon) updateMsf() {
+	if daemon.updateRunning {
+		log.Warning("An update of MSF is already running, not running again.")
+		return
+	}
+	daemon.updateRunning = true
+	log.Info("Beginning an update of MSF via Git.")
+
+	commands := []string{
+		"git pull",
+	}
+	responseData := daemon.createConsoleAndRun(commands)
+	regex := regexp.MustCompilePOSIX("Already up-to-date")
+	// skip the rest if git pull results in "Already up-to-date"
+	if regex.MatchString(responseData) {
+		log.Info("MSF is already up to date")
+		daemon.updateRunning = false
+		daemon.lastUpdate = time.Now()
+		return
+	}
+
+	commands = []string{
+		"reload_all",
+	}
+	_ = daemon.createConsoleAndRun(commands)
+
+	// search modules for keywords, keep track of how many results there are, notify if it changes
+	var buffer bytes.Buffer
+	buffer.WriteString("search ")
+	for _, service := range *daemon.Services {
+		buffer.WriteString(fmt.Sprintf("%s ", service.Name))
+	}
+	commands = []string{
+		buffer.String(),
+	}
+	responseData = daemon.createConsoleAndRun(commands)
+
+	for _, service := range *daemon.Services {
+		newModules := []string{}
+		regex := regexp.MustCompilePOSIX(fmt.Sprintf("^.*%s*.*$", service.Name))
+		lines := regex.FindAllString(responseData, -1)
+		for _, line := range lines {
+			exists := false
+			for _, knownModule := range daemon.knownModules[service.Name] {
+				if line == knownModule {
+					exists = true
+				}
+			}
+			if !exists {
+				newModules = append(newModules, line)
+			}
+		}
+		daemon.knownModules[service.Name] = lines
+		if len(newModules) != 0 {
+			var subject = fmt.Sprintf("New MSF modules matching '%s' found", service.Name)
+			var message = fmt.Sprintf("After updating MSF, found the following new modules with '%s' in the name/description:\t\n%s",
+				service.Name, strings.Join(newModules, "\n"),
+			)
+			daemon.sendEmail(&subject, &message)
+		} else {
+			log.Info("No new modules matching '%s' were found.", service.Name)
+		}
+	}
+
+	daemon.updateRunning = false
+	daemon.lastUpdate = time.Now()
+}
+
+// create console and run commands
+func (daemon *Daemon) createConsoleAndRun(commands []string) (responseData string) {
+	var buffer bytes.Buffer
+	console, err := daemon.API.ConsoleCreate()
+	if err != nil {
+		log.Fatal(err)
+	}
+	log.Debug("New console allocated: %v", console)
+
+	_, err = daemon.API.ConsoleRead(console.ID)
+	if err != nil {
+		log.Fatal(err)
+	}
+	log.Debug("Discarded console banner.")
+
+	for _, command := range commands {
+		command = fmt.Sprintf("%s\n", command)
+		err = daemon.API.ConsoleWrite(console.ID, command)
+		if err != nil {
+			log.Fatal(err)
+		}
+		log.Debug("Wrote '%#v' to console %v", command, console.ID)
+		// don't read too soon or you get blank response
+		time.Sleep(750 * time.Millisecond)
+		busy := true
+		for busy {
+			response, err := daemon.API.ConsoleRead(console.ID)
+			if err != nil {
+				log.Fatal(err)
+			}
+			log.Debug("Read console %v output:\n%v", console.ID, response.Data)
+			buffer.WriteString(response.Data)
+			if response.Busy {
+				log.Debug("Console %v is still busy, sleeping 3 seconds..", console.ID)
+				time.Sleep(3 * time.Second)
+			} else {
+				busy = false
+			}
+		}
+	}
+
+	err = daemon.API.ConsoleDestroy(console.ID)
+	if err != nil {
+		log.Fatal(err)
+	}
+	log.Debug("Successfully removed console %v", console)
+	return buffer.String()
+}
+
+// regular status/update email
+func (daemon *Daemon) CreateStatusNotifier() {
+	_, err := daemon.internalCron.AddFunc(daemon.cfg.Sploit.StatusSpec, daemon.sendStatusEmail)
+	if err != nil {
+		log.Fatal(err)
+	}
+}
+
+func (daemon *Daemon) sendStatusEmail() {
+	var subject = "MSF regular Status Update"
+	var message bytes.Buffer
+	// last successful MSF update
+	when := "[An update has not yet been run]"
+	if !daemon.lastUpdate.IsZero() {
+		when = daemon.lastUpdate.String()
+	}
+	message.WriteString(fmt.Sprintf("Last successful MSF update: %v\n\n", when))
+	// number of scans since last status email
+	message.WriteString(fmt.Sprintf("%d scans have been run since the last email update\n\n", daemon.scanCount))
+	// known vulns
+	vulns := daemon.selectVulns()
+	if len(*vulns) > 0 {
+		message.WriteString("Currently know vulnerabilities: (Notifications have previously been sent.)\n\n")
+		for _, vuln := range *vulns {
+			str := fmt.Sprintf("\t%v %v %v %v\n", vuln.CreatedAt, vuln.Address, vuln.Name, vuln.References)
+			message.WriteString(str)
+		}
+	} else {
+		message.WriteString("No currently know vulnerabilities\n")
+	}
+	msg := message.String()
+	daemon.sendEmail(&subject, &msg)
+	daemon.scanCount = 0
+	log.Debug("Sent Status Email")
+}
+
+func loadOrCreateFile(name string) *os.File {
+	if _, err := os.Stat(name); os.IsNotExist(err) {
+		file, err := os.Create(name)
+		if err != nil {
+			log.Fatalf("Error with os.Create(): %v", err)
+		}
+		log.Debug("Created file %v", name)
+		return file
+	} else {
+		file, err := os.OpenFile(name, os.O_RDWR|os.O_CREATE|os.O_APPEND, 0640)
+		if err != nil {
+			log.Fatalf("Error with os.Open(): %v", err)
+		}
+		log.Debug("Opened existing file %v", name)
+		return file
+	}
+}
 
 var log = logging.MustGetLogger("sploit")
-var logFormat = logging.MustStringFormatter(
-	"%{color}%{time:15:04:05.000} %{shortfunc} ▶ %{level:.4s} %{id:03x} %{message}%{color:reset}",
-)
 
 func main() {
+	// TODO recover from most errors
+	// TODO use a bash start.sh script to run postgres and msfrpcd in the same container
 	// Do it already
 	daemon := &Daemon{}
+	daemon.knownModules = map[string][]string{}
+	daemon.LoadFlags()
+	daemon.LoadSploitYaml()
 	daemon.SetupLogging()
 	log.Info("Daemon starting up now")
-	daemon.LoadFlags()
 	daemon.waitGroup = *new(sync.WaitGroup) // supply a mechanism for staying running
 	daemon.CreateInterruptChannel()
-	daemon.LoadSploitYaml()
 	daemon.LoadModulesYaml()
 	daemon.LoadHostYamls()
 	daemon.OpenDBConnection()
 	daemon.API = msfapi.New(daemon.cfg.MsfRpc.URI)
 	daemon.SetupAPIToken()
 	daemon.CreateNotifier()
-	daemon.CreateCronDaemon()
+	daemon.cron = *cron.New()
 	daemon.CreateCronEntries()
 	daemon.cron.Start()
 	daemon.CreateWatchers()
 	daemon.CreateWebserver()
-	// TODO recover from most errors
-	// daemon.CreateUpdaterNotifier()
-	// weekly status/update email
+	daemon.CreateUpdaterNotifier()
+	daemon.CreateStatusNotifier()
 	daemon.waitGroup.Wait() // Stay running until wg.Done() is called
 }

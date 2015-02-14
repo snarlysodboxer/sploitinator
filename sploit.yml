@@ -3,6 +3,10 @@ sploit:
   watchdir: "host.d"
   modulesfile: "modules.yml"
   serveaddress: "127.0.0.1:8080"
+  updatespec: "@every 10s" # when to update MSF with git
+  statusspec: "@every 10m" # when to send a status email
+  loginfo: "sploitInfo.log"
+  logdebug: "sploitDebug.log" # set to "" for no debug logging
 msfrpc:
   uri: "http://localhost:3790/api/1.0"
   user: "admin"
@@ -17,4 +21,4 @@ smtp:
   pass: "mypass"
   host: "smtp.example.net:587"
   from: "msf@example.com"
-  to: "admin@example.com"
+  to: "admin1@example.com admin2@example.com"

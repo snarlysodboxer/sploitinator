@@ -1,9 +1,8 @@
 - name: ssh
   modules:
   - name: "POODLE Scanner" # arbitrary
-    cronspec: "@every 10s"
+    cronspec: "@every 1d"
     commands:
-    - "db_connect /metasploit-framework/config/database.yml"
     - "use auxiliary/scanner/http/ssl_version"
     - "set RHOSTS SPLOITHOSTNAME" # SPLOITHOSTNAME will be subbed at runtime
     - "set RPORT SPLOITHOSTPORT" # SPLOITHOSTPORT will be subbed at runtime
@@ -12,7 +11,6 @@
   - name: "blahditty" # arbitrary
     cronspec: "30 * * * *"
     commands:
-    - "db_connect /metasploit-framework/config/database.yml"
     - "use auxiliary/ssh/blahdittyblah"
     - "set RHOST SPLOITHOSTNAME" # SPLOITHOSTNAME will be subbed at runtime
     - "set RPORT SPLOITHOSTPORT" # SPLOITHOSTPORT will be subbed at runtime
@@ -24,7 +22,6 @@
   - name: "nginx" # arbitrary
     cronspec: "30 * * * *"
     commands:
-    - "db_connect /metasploit-framework/config/database.yml"
     - "use auxiliary/nginx/testing123"
     - "set RHOST SPLOITHOSTNAME" # SPLOITHOSTNAME will be subbed at runtime
     - "set RPORT SPLOITHOSTPORT" # SPLOITHOSTPORT will be subbed at runtime
@@ -36,7 +33,6 @@
   - name: "nginxssl" # arbitrary
     cronspec: "30 * * * *"
     commands:
-    - "db_connect /metasploit-framework/config/database.yml"
     - "use auxiliary/nginxssl/ssl"
     - "set RHOST SPLOITHOSTNAME" # SPLOITHOSTNAME will be subbed at runtime
     - "set RPORT SPLOITHOSTPORT" # SPLOITHOSTPORT will be subbed at runtime
@@ -48,7 +44,6 @@
   - name: "railsssl" # arbitrary
     cronspec: "30 * * * *"
     commands:
-    - "db_connect /metasploit-framework/config/database.yml"
     - "use auxiliary/rails/railsssl"
     - "set RHOST SPLOITHOSTNAME" # SPLOITHOSTNAME will be subbed at runtime
     - "set RPORT SPLOITHOSTPORT" # SPLOITHOSTPORT will be subbed at runtime
@@ -60,7 +55,6 @@
   - name: "postgres" # arbitrary
     cronspec: "30 * * * *"
     commands:
-    - "db_connect /metasploit-framework/config/database.yml"
     - "use auxiliary/postgres/blahello"
     - "set RHOST SPLOITHOSTNAME" # SPLOITHOSTNAME will be subbed at runtime
     - "set RPORT SPLOITHOSTPORT" # SPLOITHOSTPORT will be subbed at runtime
