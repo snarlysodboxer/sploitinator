@@ -92,6 +92,7 @@ type Daemon struct {
 	API           *msfapi.API
 	interruptChan chan os.Signal
 	notifierChan  chan bool
+	errorChan     chan string
 	cron          cron.Cron
 	internalCron  cron.Cron
 	updateRunning bool
@@ -179,14 +180,15 @@ func (daemon *Daemon) CreateInterruptChannel() {
 			daemon.cron.Stop()                                  // Stop the scheduler (does not stop any jobs already running).
 			err := daemon.API.AuthTokenRemove(daemon.API.Token) // essentially logout
 			if err != nil {
-				log.Fatal(err)
+				message := fmt.Sprintf("Error removing Auth token:\n%v", err)
+				log.Critical(message)
+				daemon.errorChan <- message
 			}
 			log.Debug("Removed auth token %v", daemon.API.Token)
 			defer daemon.db.Close()
 			defer daemon.infoWriter.Close()
 			defer daemon.debugWriter.Close()
 			daemon.waitGroup.Done()
-			// os.Exit(0)
 		}
 	}()
 }
@@ -203,19 +205,25 @@ func (daemon *Daemon) LoadSploitYaml() {
 		log.Fatal(err)
 	}
 	daemon.cfg = cfg
-	fmt.Println("Successfully loaded Sploit yaml file")
+	log.Info("Successfully loaded Sploit yaml file")
 }
 
 // read modules.yml and map service names to Metasploit modules
 func (daemon *Daemon) LoadModulesYaml() {
 	contents, err := ioutil.ReadFile(daemon.cfg.Sploit.ModulesFile)
 	if err != nil {
-		log.Fatal(err)
+		message := fmt.Sprintf("Error loading modules YAML file:\n%v", err)
+		log.Critical(message)
+		daemon.errorChan <- message
+		return
 	}
 	services := []service{}
 	err = yaml.Unmarshal([]byte(contents), &services)
 	if err != nil {
-		log.Fatal(err)
+		message := fmt.Sprintf("Error unmarshaling YAML file:\n%v", err)
+		log.Critical(message)
+		daemon.errorChan <- message
+		return
 	}
 	daemon.Services = &services // overwrite old
 	log.Info("Successfully loaded modules yaml file")
@@ -226,7 +234,10 @@ func (daemon *Daemon) LoadModulesYaml() {
 func (daemon *Daemon) LoadHostYamls() {
 	files, err := ioutil.ReadDir(fmt.Sprintf("./%s", daemon.cfg.Sploit.WatchDir))
 	if err != nil {
-		log.Fatal(err)
+		message := fmt.Sprintf("Error reading host.d directory:\n%v", err)
+		log.Critical(message)
+		daemon.errorChan <- message
+		return
 	}
 	hosts := []host{}
 	for _, file := range files {
@@ -235,12 +246,18 @@ func (daemon *Daemon) LoadHostYamls() {
 			if regex.MatchString(file.Name()) {
 				contents, err := ioutil.ReadFile(fmt.Sprintf("%s/%s", daemon.cfg.Sploit.WatchDir, file.Name()))
 				if err != nil {
-					log.Fatal(err)
+					message := fmt.Sprintf("Error loading YAML file:\n%v", err)
+					log.Critical(message)
+					daemon.errorChan <- message
+					return
 				}
 				host := host{}
 				err = yaml.Unmarshal([]byte(contents), &host)
 				if err != nil {
-					log.Fatal(err)
+					message := fmt.Sprintf("Error unmarshaling YAML file:\n%v", err)
+					log.Critical(message)
+					daemon.errorChan <- message
+					return
 				}
 				hosts = append(hosts, host)
 			}
@@ -304,7 +321,10 @@ func (daemon *Daemon) CreateCronEntries() {
 				daemon.runModuleAgainstEachHostPort(daemonService.Name, &module)
 			})
 			if err != nil {
-				log.Fatal(err)
+				message := fmt.Sprintf("Error adding cron entry:\n%v", err)
+				log.Critical(message)
+				daemon.errorChan <- message
+				return
 			}
 			daemon.waitGroup.Add(1)
 		}
@@ -338,7 +358,13 @@ func (daemon *Daemon) runModuleAgainstEachHostPort(serviceName string, module *m
 						module.Name, port, host.Name)
 					log.Debug("Module details: %v", module)
 					log.Debug("Commands that will be run:\n%#v", commands)
-					_ = daemon.createConsoleAndRun(commands)
+					_, err := daemon.createConsoleAndRun(commands)
+					if err != nil {
+						message := fmt.Sprintf("Error running commands in console:\n%v", err)
+						log.Critical(message)
+						daemon.errorChan <- message
+						return
+					}
 				}
 			}
 		}
@@ -360,7 +386,8 @@ func (daemon *Daemon) CreateNotifier() {
 }
 
 // check for vulns in the database with an sql statement
-func (daemon *Daemon) selectVulns() *[]vulnerability {
+func (daemon *Daemon) selectVulns() (*[]vulnerability, error) {
+	vulnerabilities := []vulnerability{}
 	query := strings.Join([]string{
 		"SELECT vulns.id,vulns.created_at,hosts.address,vulns.name,array_agg(refs.name) AS references",
 		"FROM vulns,hosts,vulns_refs,refs",
@@ -369,15 +396,14 @@ func (daemon *Daemon) selectVulns() *[]vulnerability {
 	}, " ")
 	vulns, err := daemon.db.Query(query)
 	if err != nil {
-		log.Fatal(err)
+		return &vulnerabilities, err
 	}
 	defer vulns.Close()
-	vulnerabilities := []vulnerability{}
 	for vulns.Next() {
 		var vuln = vulnerability{}
 		err = vulns.Scan(&vuln.id, &vuln.CreatedAt, &vuln.Address, &vuln.Name, &vuln.References)
 		if err != nil {
-			log.Fatal(err)
+			return &vulnerabilities, err
 		}
 		vuln.References = strings.Replace(vuln.References, ",", " ", -1)
 		vuln.References = strings.Replace(vuln.References, "-http", " http", 1)
@@ -385,12 +411,18 @@ func (daemon *Daemon) selectVulns() *[]vulnerability {
 			vuln.CreatedAt, vuln.Address, vuln.Name, vuln.References)
 		vulnerabilities = append(vulnerabilities, vuln)
 	}
-	return &vulnerabilities
+	return &vulnerabilities, nil
 }
 
 // record vulns database IDs and send emails when new vulns are found
 func (daemon *Daemon) recordAndNotify() {
-	vulns := daemon.selectVulns()
+	vulns, err := daemon.selectVulns()
+	if err != nil {
+		message := fmt.Sprintf("Error selecting vulns from the database:\n%v", err)
+		log.Critical(message)
+		daemon.errorChan <- message
+		return
+	}
 	for _, vuln := range *vulns {
 		known := false
 		for _, vulnID := range daemon.knownVulnIDs {
@@ -418,14 +450,14 @@ func (daemon *Daemon) sendEmail(subject, message *string) {
 		"\r\n\r\n" + *message
 	domain, _, err := net.SplitHostPort(daemon.cfg.SMTP.Host)
 	if err != nil {
-		log.Fatalf("Error with net.SplitHostPort: %v", err)
+		log.Critical("Error with net.SplitHostPort: %v", err)
 	}
 	auth := smtp.PlainAuth("", daemon.cfg.SMTP.User, daemon.cfg.SMTP.Pass, domain)
 	err = smtp.SendMail(daemon.cfg.SMTP.Host, auth, daemon.cfg.SMTP.From,
 		strings.Fields(daemon.cfg.SMTP.To), []byte(body))
 	if err != nil {
-		log.Fatalf("Error with smtp.SendMail: %v\n\n", err)
-		log.Fatalf("Body: %v\n\n", body)
+		log.Critical("Error with smtp.SendMail: %v\n\n", err)
+		log.Critical("Body: %v\n\n", body)
 	}
 }
 
@@ -447,7 +479,7 @@ func (daemon *Daemon) CreateWatchers() {
 		}
 		defer watcher.Close()
 
-		done := make(chan bool)
+		done := make(chan bool) // block until emptied
 		timer := time.NewTimer(0 * time.Second)
 		<-timer.C //empty the channel
 		var event string
@@ -460,7 +492,9 @@ func (daemon *Daemon) CreateWatchers() {
 					log.Debug("Reset timer for event: %v", evnt)
 					event = evnt.Name
 				case err := <-watcher.Errors:
-					log.Fatalf("error:", err)
+					message := fmt.Sprintf("Error with file watcher:\n%v", err)
+					log.Critical(message)
+					daemon.errorChan <- message
 				}
 			}
 		}()
@@ -506,7 +540,13 @@ func (daemon *Daemon) rootHandler(writer http.ResponseWriter, request *http.Requ
 		Vulns       []vulnerability
 	}
 	data.CronEntries = daemon.cron.Entries()
-	data.Vulns = *daemon.selectVulns()
+	vulns, err := daemon.selectVulns()
+	if err != nil {
+		message := fmt.Sprintf("Error selecting vulns from the database:\n%v", err)
+		log.Critical(message)
+		daemon.errorChan <- message
+	}
+	data.Vulns = *vulns
 	tmpl := template.Must(template.ParseFiles("root.html"))
 	tmpl.Execute(writer, &data)
 }
@@ -534,7 +574,13 @@ func (daemon *Daemon) updateMsf() {
 	commands := []string{
 		"git pull",
 	}
-	responseData := daemon.createConsoleAndRun(commands)
+	responseData, err := daemon.createConsoleAndRun(commands)
+	if err != nil {
+		message := fmt.Sprintf("Error running commands in console:\n%v", err)
+		log.Critical(message)
+		daemon.errorChan <- message
+		return
+	}
 	regex := regexp.MustCompilePOSIX("Already up-to-date")
 	// skip the rest if git pull results in "Already up-to-date"
 	if regex.MatchString(responseData) {
@@ -547,7 +593,13 @@ func (daemon *Daemon) updateMsf() {
 	commands = []string{
 		"reload_all",
 	}
-	_ = daemon.createConsoleAndRun(commands)
+	_, err = daemon.createConsoleAndRun(commands)
+	if err != nil {
+		message := fmt.Sprintf("Error running commands in console:\n%v", err)
+		log.Critical(message)
+		daemon.errorChan <- message
+		return
+	}
 
 	// search modules for keywords, keep track of how many results there are, notify if it changes
 	var buffer bytes.Buffer
@@ -558,8 +610,13 @@ func (daemon *Daemon) updateMsf() {
 	commands = []string{
 		buffer.String(),
 	}
-	responseData = daemon.createConsoleAndRun(commands)
-
+	responseData, err = daemon.createConsoleAndRun(commands)
+	if err != nil {
+		message := fmt.Sprintf("Error running commands in console:\n%v", err)
+		log.Critical(message)
+		daemon.errorChan <- message
+		return
+	}
 	for _, service := range *daemon.Services {
 		newModules := []string{}
 		regex := regexp.MustCompilePOSIX(fmt.Sprintf("^.*%s*.*$", service.Name))
@@ -592,17 +649,23 @@ func (daemon *Daemon) updateMsf() {
 }
 
 // create console and run commands
-func (daemon *Daemon) createConsoleAndRun(commands []string) (responseData string) {
+func (daemon *Daemon) createConsoleAndRun(commands []string) (string, error) {
 	var buffer bytes.Buffer
 	console, err := daemon.API.ConsoleCreate()
 	if err != nil {
-		log.Fatal(err)
+		message := fmt.Sprintf("Error with ConsoleCreate:\n%v", err)
+		log.Critical(message)
+		daemon.errorChan <- message
+		return "", err
 	}
 	log.Debug("New console allocated: %v", console)
 
 	_, err = daemon.API.ConsoleRead(console.ID)
 	if err != nil {
-		log.Fatal(err)
+		message := fmt.Sprintf("Error with ConsoleRead:\n%v", err)
+		log.Critical(message)
+		daemon.errorChan <- message
+		return "", err
 	}
 	log.Debug("Discarded console banner.")
 
@@ -610,7 +673,10 @@ func (daemon *Daemon) createConsoleAndRun(commands []string) (responseData strin
 		command = fmt.Sprintf("%s\n", command)
 		err = daemon.API.ConsoleWrite(console.ID, command)
 		if err != nil {
-			log.Fatal(err)
+			message := fmt.Sprintf("Error with ConsoleWrite:\n%v", err)
+			log.Critical(message)
+			daemon.errorChan <- message
+			return "", err
 		}
 		log.Debug("Wrote '%#v' to console %v", command, console.ID)
 		// don't read too soon or you get blank response
@@ -619,7 +685,10 @@ func (daemon *Daemon) createConsoleAndRun(commands []string) (responseData strin
 		for busy {
 			response, err := daemon.API.ConsoleRead(console.ID)
 			if err != nil {
-				log.Fatal(err)
+				message := fmt.Sprintf("Error with ConsoleRead:\n%v", err)
+				log.Critical(message)
+				daemon.errorChan <- message
+				return "", err
 			}
 			log.Debug("Read console %v output:\n%v", console.ID, response.Data)
 			buffer.WriteString(response.Data)
@@ -634,10 +703,13 @@ func (daemon *Daemon) createConsoleAndRun(commands []string) (responseData strin
 
 	err = daemon.API.ConsoleDestroy(console.ID)
 	if err != nil {
-		log.Fatal(err)
+		message := fmt.Sprintf("Error with ConsoleDestroy:\n%v", err)
+		log.Critical(message)
+		daemon.errorChan <- message
+		return "", err
 	}
 	log.Debug("Successfully removed console %v", console)
-	return buffer.String()
+	return buffer.String(), nil
 }
 
 // regular status/update email
@@ -660,7 +732,13 @@ func (daemon *Daemon) sendStatusEmail() {
 	// number of scans since last status email
 	message.WriteString(fmt.Sprintf("%d scans have been run since the last email update\n\n", daemon.scanCount))
 	// known vulns
-	vulns := daemon.selectVulns()
+	vulns, err := daemon.selectVulns()
+	if err != nil {
+		message := fmt.Sprintf("Error selecting vulns from the database:\n%v", err)
+		log.Critical(message)
+		daemon.errorChan <- message
+		return
+	}
 	if len(*vulns) > 0 {
 		message.WriteString("Currently know vulnerabilities: (Notifications have previously been sent.)\n\n")
 		for _, vuln := range *vulns {
@@ -694,10 +772,19 @@ func loadOrCreateFile(name string) *os.File {
 	}
 }
 
+func (daemon *Daemon) CreateErrorEmailer() {
+	daemon.errorChan = make(chan string, 10)
+	go func() {
+		for message := range daemon.errorChan {
+			var subject = "An error occured with Sploit:"
+			daemon.sendEmail(&subject, &message)
+		}
+	}()
+}
+
 var log = logging.MustGetLogger("sploit")
 
 func main() {
-	// TODO recover from most errors
 	// TODO use a bash start.sh script to run postgres and msfrpcd in the same container
 	// Do it already
 	daemon := &Daemon{}
@@ -708,6 +795,7 @@ func main() {
 	log.Info("Daemon starting up now")
 	daemon.waitGroup = *new(sync.WaitGroup) // supply a mechanism for staying running
 	daemon.CreateInterruptChannel()
+	daemon.CreateErrorEmailer()
 	daemon.LoadModulesYaml()
 	daemon.LoadHostYamls()
 	daemon.OpenDBConnection()
