@@ -27,7 +27,7 @@
 		},
 		{
 			"ImportPath": "github.com/snarlysodboxer/msfapi",
-			"Rev": "c98f031455594d737cc1e4929b1eb71bd09bbb38"
+			"Rev": "8e686990f0f27eea634fda37db253af156d87e97"
 		},
 		{
 			"ImportPath": "gopkg.in/fsnotify.v1",
