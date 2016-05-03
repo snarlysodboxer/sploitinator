@@ -99,7 +99,7 @@ type Daemon struct {
 	lastUpdate    time.Time
 	waitGroup     sync.WaitGroup
 	cfg           config
-	configFile    string
+	configFile    *string
 	db            sql.DB
 	knownVulnIDs  []int
 	knownModules  map[string][]string
@@ -146,27 +146,21 @@ func (daemon *Daemon) SetupLogging() {
 }
 
 func (daemon *Daemon) LoadFlags() {
-	daemon.configFile = *flag.StringP("config-file", "c", "sploit.yml",
+	daemon.configFile = flag.StringP("config-file", "c", "sploit.yml",
 		"File to read Sploit settings.")
 	flag.Usage = func() {
 		fmt.Printf("Usage:\n")
 		flag.PrintDefaults()
 	}
-	_, err := os.Stat(daemon.configFile)
-	fileExists := !os.IsNotExist(err)
 	flag.Parse()
-	switch {
-	case flag.NFlag() == 0:
-		if !fileExists {
-			flag.Usage()
-			return
-		}
-	case flag.NFlag() == 1:
-		if !fileExists {
-			log.Fatalf("File %s not found!", daemon.configFile)
-		}
-	default:
-		log.Fatal("Wrong number of arguements; 0 or 1.")
+	if flag.NFlag() != 1 {
+		flag.Usage()
+		os.Exit(1)
+	}
+	_, err := os.Stat(*daemon.configFile)
+	fileExists := !os.IsNotExist(err)
+	if !fileExists {
+		log.Fatalf("File %s not found!", *daemon.configFile)
 	}
 }
 
@@ -195,7 +189,7 @@ func (daemon *Daemon) CreateInterruptChannel() {
 
 // read sploit.yml and set settings
 func (daemon *Daemon) LoadSploitYaml() {
-	contents, err := ioutil.ReadFile(daemon.configFile)
+	contents, err := ioutil.ReadFile(*daemon.configFile)
 	if err != nil {
 		log.Fatal(err)
 	}
@@ -232,7 +226,7 @@ func (daemon *Daemon) LoadModulesYaml() {
 
 // read host.yml files from host.d into daemon.Hosts
 func (daemon *Daemon) LoadHostYamls() {
-	files, err := ioutil.ReadDir(fmt.Sprintf("./%s", daemon.cfg.Sploit.WatchDir))
+	files, err := ioutil.ReadDir(daemon.cfg.Sploit.WatchDir)
 	if err != nil {
 		message := fmt.Sprintf("Error reading host.d directory:\n%v", err)
 		log.Critical(message)

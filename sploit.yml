@@ -3,8 +3,8 @@ sploit:
   watchdir: "host.d"
   modulesfile: "modules.yml"
   serveaddress: "127.0.0.1:8080"
-  updatespec: "@every 10s" # when to update MSF with git
-  statusspec: "@every 10m" # when to send a status email
+  updatespec: "@every 1d" # when to update MSF with git
+  statusspec: "@every 1d" # when to send a status email
   loginfo: "sploitInfo.log"
   logdebug: "sploitDebug.log" # set to "" for no debug logging
 msfrpc:
