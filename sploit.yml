@@ -6,7 +6,6 @@ sploit:
   updatespec: "@every 1d" # when to update MSF with git
   statusspec: "@every 1d" # when to send a status email
   loginfo: "sploitInfo.log"
-  logdebug: "sploitDebug.log" # set to "" for no debug logging
 msfrpc:
   uri: "http://localhost:3790/api/1.0"
   user: "admin"

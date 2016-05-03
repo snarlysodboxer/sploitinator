@@ -104,8 +104,8 @@ type Daemon struct {
 	knownVulnIDs  []int
 	knownModules  map[string][]string
 	scanCount     int
-	infoWriter    *os.File
-	debugWriter   *os.File
+	logWriter     *os.File
+	debugMode     *bool
 }
 
 type vulnerability struct {
@@ -117,43 +117,31 @@ type vulnerability struct {
 }
 
 func (daemon *Daemon) SetupLogging() {
-	daemon.infoWriter = loadOrCreateFile(daemon.cfg.Sploit.LogInfo)
-	var logFormatInfo = logging.MustStringFormatter(
-		"%{color}%{time:15:04:05.000} %{level:.8s} pid:%{pid} %{message}%{color:reset}",
+	daemon.logWriter = createAndLoadFile(daemon.cfg.Sploit.LogInfo)
+	var logFormat = logging.MustStringFormatter(
+		"%{color}%{time:15:04:05.000} %{level:.8s} %{shortfunc} ▶ %{message}%{color:reset}",
 	)
-	multiWriter := io.MultiWriter(os.Stderr, daemon.infoWriter)
-	logBackendInfo := logging.NewLogBackend(multiWriter, "", 0)
-	logBackendFormatterInfo := logging.NewBackendFormatter(logBackendInfo, logFormatInfo)
-	logBackendLeveledInfo := logging.AddModuleLevel(logBackendFormatterInfo)
-	if os.Getenv("DEBUG") == "true" {
-		logBackendLeveledInfo.SetLevel(logging.DEBUG, "sploit")
+	multiWriter := io.MultiWriter(os.Stderr, daemon.logWriter)
+	logBackend := logging.NewLogBackend(multiWriter, "", 0)
+	logBackendFormatter := logging.NewBackendFormatter(logBackend, logFormat)
+	logBackendLeveled := logging.AddModuleLevel(logBackendFormatter)
+	logging.SetBackend(logBackendLeveled)
+	if *daemon.debugMode {
+		logBackendLeveled.SetLevel(logging.DEBUG, "sploit")
 	} else {
-		logBackendLeveledInfo.SetLevel(logging.INFO, "sploit")
-	}
-	if daemon.cfg.Sploit.LogDebug != "" {
-		daemon.debugWriter = loadOrCreateFile(daemon.cfg.Sploit.LogDebug)
-		var logFormatDebug = logging.MustStringFormatter(
-			"%{color}%{time:15:04:05.000} %{shortfunc} ▶ %{level:.4s} %{id:03x} %{message}%{color:reset}",
-		)
-		logBackendDebug := logging.NewLogBackend(daemon.debugWriter, "", 0)
-		logBackendFormatterDebug := logging.NewBackendFormatter(logBackendDebug, logFormatDebug)
-		logBackendLeveledDebug := logging.AddModuleLevel(logBackendFormatterDebug)
-		logBackendLeveledDebug.SetLevel(logging.DEBUG, "sploit")
-		logging.SetBackend(logBackendLeveledInfo, logBackendLeveledDebug)
-	} else {
-		logging.SetBackend(logBackendLeveledInfo)
+		logBackendLeveled.SetLevel(logging.INFO, "sploit")
 	}
 }
 
 func (daemon *Daemon) LoadFlags() {
-	daemon.configFile = flag.StringP("config-file", "c", "sploit.yml",
-		"File to read Sploit settings.")
+	daemon.configFile = flag.StringP("config-file", "c", "sploit.yml", "File to read Sploit settings")
+	daemon.debugMode = flag.Bool("debug", false, "Enable debug logging")
 	flag.Usage = func() {
 		fmt.Printf("Usage:\n")
 		flag.PrintDefaults()
 	}
 	flag.Parse()
-	if flag.NFlag() != 1 {
+	if !(flag.NFlag() == 1 || flag.NFlag() == 2) {
 		flag.Usage()
 		os.Exit(1)
 	}
@@ -180,8 +168,7 @@ func (daemon *Daemon) CreateInterruptChannel() {
 			}
 			log.Debug("Removed auth token %v", daemon.API.Token)
 			defer daemon.db.Close()
-			defer daemon.infoWriter.Close()
-			defer daemon.debugWriter.Close()
+			defer daemon.logWriter.Close()
 			daemon.waitGroup.Done()
 		}
 	}()
@@ -265,7 +252,7 @@ func (daemon *Daemon) LoadHostYamls() {
 func (daemon *Daemon) SetupAPIToken() {
 	tempToken, err := daemon.API.AuthLogin(daemon.cfg.MsfRpc.User, daemon.cfg.MsfRpc.Pass)
 	if err != nil {
-		log.Fatal(err)
+		log.Fatalf("Error with AuthLogin: %s", err)
 	}
 	daemon.API.Token = tempToken
 	log.Debug("Got temp auth token: %v", tempToken)
@@ -273,20 +260,20 @@ func (daemon *Daemon) SetupAPIToken() {
 	permToken := strings.Replace(tempToken, "TEMP", "PERM", -1)
 	err = daemon.API.AuthTokenAdd(permToken)
 	if err != nil {
-		log.Fatal(err)
+		log.Fatalf("Error with AuthTokenAdd: %s", err)
 	}
 	daemon.API.Token = permToken
 	log.Debug("Set permanent auth token: %v", permToken)
 
 	err = daemon.API.AuthTokenRemove(tempToken)
 	if err != nil {
-		log.Fatal(err)
+		log.Fatalf("Error with AuthTokenRemove: %s", err)
 	}
 	log.Debug("Removed temporary auth token: %v", tempToken)
 
 	tokens, err := daemon.API.AuthTokenList()
 	if err != nil {
-		log.Fatal(err)
+		log.Fatalf("Error with AuthTokenList: %s", err)
 	}
 	log.Debug("Current Token list: %v", tokens)
 }
@@ -748,7 +735,7 @@ func (daemon *Daemon) sendStatusEmail() {
 	log.Debug("Sent Status Email")
 }
 
-func loadOrCreateFile(name string) *os.File {
+func createAndLoadFile(name string) *os.File {
 	if _, err := os.Stat(name); os.IsNotExist(err) {
 		file, err := os.Create(name)
 		if err != nil {
@@ -779,14 +766,13 @@ func (daemon *Daemon) CreateErrorEmailer() {
 var log = logging.MustGetLogger("sploit")
 
 func main() {
-	// TODO use a bash start.sh script to run postgres and msfrpcd in the same container
 	// Do it already
 	daemon := &Daemon{}
 	daemon.knownModules = map[string][]string{}
 	daemon.LoadFlags()
 	daemon.LoadSploitYaml()
 	daemon.SetupLogging()
-	log.Info("Daemon starting up now")
+	log.Info("Starting Sploitinator")
 	daemon.waitGroup = *new(sync.WaitGroup) // supply a mechanism for staying running
 	daemon.CreateInterruptChannel()
 	daemon.CreateErrorEmailer()
