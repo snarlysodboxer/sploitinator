@@ -29,11 +29,11 @@ import (
 )
 
 type msfConfig struct {
-	URI  string
 	User string
 	Pass string
 	Host string
 	Port string
+	URI  string
 }
 
 type sploitConfig struct {
@@ -46,10 +46,11 @@ type sploitConfig struct {
 }
 
 type postgresConfig struct {
-	DB   string
 	User string
+	Pass string
 	Host string
 	Port string
+	DB   string
 }
 
 type smtpConfig struct {
@@ -303,15 +304,20 @@ func (daemon *Daemon) SetupAPIToken() {
 
 func (daemon *Daemon) OpenDBConnection() {
 	cfg := daemon.cfg.Postgres
-	db, err := sql.Open("postgres",
-		fmt.Sprintf("user=%s host=%s port=%s dbname=%s sslmode=disable",
-			cfg.User, cfg.Host, cfg.Port, cfg.DB,
-		),
+	credentials := fmt.Sprintf(
+		"user=%s password=%s host=%s port=%s dbname=%s sslmode=disable",
+		cfg.User, cfg.Pass, cfg.Host, cfg.Port, cfg.DB,
 	)
+	log.Debug(fmt.Sprintf("Using PostgreSQL login credentials \"%s\"", credentials))
+	db, err := sql.Open("postgres", credentials)
 	if err != nil {
 		log.Fatal(err)
 	}
 	daemon.db = *db
+	err = daemon.db.Ping()
+	if err != nil {
+		log.Fatal(err)
+	}
 	log.Info("Successfully opened a database connection")
 }
 
@@ -492,9 +498,12 @@ func (daemon *Daemon) CreateWatchers() {
 			for {
 				select {
 				case evnt := <-watcher.Events:
-					timer.Reset(3 * time.Second)
-					log.Debug("Reset timer for event: %v", evnt)
-					event = evnt.Name
+					regex := regexp.MustCompilePOSIX(`.*\.yml$`)
+					if regex.MatchString(evnt.Name) {
+						timer.Reset(3 * time.Second)
+						log.Debug("Reset timer for event: %v", evnt)
+						event = evnt.Name
+					}
 				case err := <-watcher.Errors:
 					message := fmt.Sprintf("Error with file watcher:\n%v", err)
 					log.Critical(message)

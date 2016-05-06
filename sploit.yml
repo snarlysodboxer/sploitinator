@@ -13,7 +13,8 @@ msfrpc:
   port: 3790
   uri: "/api/1.0"
 postgres:
-  user: "postgres"
+  user: "msf"
+  pass: "msf"
   host: "localhost"
   port: "5432"
   db: "msf"
