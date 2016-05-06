@@ -32,6 +32,8 @@ type msfConfig struct {
 	URI  string
 	User string
 	Pass string
+	Host string
+	Port string
 }
 
 type sploitConfig struct {
@@ -40,8 +42,7 @@ type sploitConfig struct {
 	ServeAddress string
 	UpdateSpec   string
 	StatusSpec   string
-	LogInfo      string
-	LogDebug     string
+	LogFile      string
 }
 
 type postgresConfig struct {
@@ -117,11 +118,16 @@ type vulnerability struct {
 }
 
 func (daemon *Daemon) SetupLogging() {
-	daemon.logWriter = createAndLoadFile(daemon.cfg.Sploit.LogInfo)
 	var logFormat = logging.MustStringFormatter(
 		"%{color}%{time:15:04:05.000} %{level:.8s} %{shortfunc} ▶ %{message}%{color:reset}",
 	)
-	multiWriter := io.MultiWriter(os.Stderr, daemon.logWriter)
+	var multiWriter io.Writer
+	if daemon.cfg.Sploit.LogFile != "" {
+		daemon.logWriter = createAndLoadFile(daemon.cfg.Sploit.LogFile)
+		multiWriter = io.MultiWriter(os.Stderr, daemon.logWriter)
+	} else {
+		multiWriter = io.MultiWriter(os.Stderr)
+	}
 	logBackend := logging.NewLogBackend(multiWriter, "", 0)
 	logBackendFormatter := logging.NewBackendFormatter(logBackend, logFormat)
 	logBackendLeveled := logging.AddModuleLevel(logBackendFormatter)
@@ -250,20 +256,37 @@ func (daemon *Daemon) LoadHostYamls() {
 }
 
 func (daemon *Daemon) SetupAPIToken() {
+
+	// TODO create an interrupt here
+	open := false
+	for open == false {
+		address := fmt.Sprintf("%s:%s", daemon.cfg.MsfRpc.Host, daemon.cfg.MsfRpc.Port)
+		conn, err := net.Listen("tcp", address)
+		if err == nil {
+			conn.Close()
+			log.Info(fmt.Sprintf("Waiting 3 seconds for msfrpcd to take port %s", daemon.cfg.MsfRpc.Port))
+			time.Sleep(3 * time.Second)
+		} else {
+			log.Debug(fmt.Sprintf("%s", err))
+			log.Info(fmt.Sprintf("msfrpcd has taken port %s, continuing", daemon.cfg.MsfRpc.Port))
+			open = true
+		}
+	}
+
 	tempToken, err := daemon.API.AuthLogin(daemon.cfg.MsfRpc.User, daemon.cfg.MsfRpc.Pass)
 	if err != nil {
 		log.Fatalf("Error with AuthLogin: %s", err)
 	}
+	log.Debug("Logged into the MSF API, got temporary auth token: %s", tempToken)
 	daemon.API.Token = tempToken
-	log.Debug("Got temp auth token: %v", tempToken)
 
 	permToken := strings.Replace(tempToken, "TEMP", "PERM", -1)
 	err = daemon.API.AuthTokenAdd(permToken)
 	if err != nil {
 		log.Fatalf("Error with AuthTokenAdd: %s", err)
 	}
+	log.Debug("Added permanent auth token: %s", permToken)
 	daemon.API.Token = permToken
-	log.Debug("Set permanent auth token: %v", permToken)
 
 	err = daemon.API.AuthTokenRemove(tempToken)
 	if err != nil {
@@ -779,7 +802,8 @@ func main() {
 	daemon.LoadModulesYaml()
 	daemon.LoadHostYamls()
 	daemon.OpenDBConnection()
-	daemon.API = msfapi.New(daemon.cfg.MsfRpc.URI)
+	address := fmt.Sprintf("http://%s:%s%s", daemon.cfg.MsfRpc.Host, daemon.cfg.MsfRpc.Port, daemon.cfg.MsfRpc.URI)
+	daemon.API = msfapi.New(address)
 	daemon.SetupAPIToken()
 	daemon.CreateNotifier()
 	daemon.cron = *cron.New()

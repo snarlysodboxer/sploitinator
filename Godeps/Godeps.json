@@ -1,7 +1,7 @@
 {
 	"ImportPath": "github.com/snarlysodboxer/sploitinator",
 	"GoVersion": "go1.6",
-	"GodepVersion": "v62",
+	"GodepVersion": "v63",
 	"Deps": [
 		{
 			"ImportPath": "github.com/abbot/go-http-auth",
@@ -27,7 +27,7 @@
 		},
 		{
 			"ImportPath": "github.com/snarlysodboxer/msfapi",
-			"Rev": "8e686990f0f27eea634fda37db253af156d87e97"
+			"Rev": "c3b9d50aa7cc7c218e0c4c115e0dd01f3a282af8"
 		},
 		{
 			"ImportPath": "gopkg.in/fsnotify.v1",

@@ -47,5 +47,5 @@ if [[ $? -ne 0 ]]; then echo "msfrpcd exited unexpectedly"; exit 1; fi
 ## Start Sploit
 echo "starting sploit"
 cd /sploitinator
-/sploit --config-file="/sploitinator/sploit.yml"
+/sploit --config-file="/sploitinator/sploit.yml" --debug
 

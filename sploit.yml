@@ -5,16 +5,18 @@ sploit:
   serveaddress: "127.0.0.1:8080"
   updatespec: "@every 1d" # when to update MSF with git
   statusspec: "@every 1d" # when to send a status email
-  loginfo: "sploitInfo.log"
+  logfile: "sploitInfo.log" # set to "" to only use stdout/stderr
 msfrpc:
-  uri: "http://localhost:3790/api/1.0"
   user: "admin"
   pass: "mypass"
+  host: "localhost"
+  port: 3790
+  uri: "/api/1.0"
 postgres:
-  db: "msf"
   user: "postgres"
   host: "localhost"
   port: "5432"
+  db: "msf"
 smtp:
   user: "admin@example.com"
   pass: "mypass"
