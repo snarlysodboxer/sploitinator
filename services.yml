@@ -1,4 +1,4 @@
-- name: ssh
+- name: ssh # match with name in host.d/example.com.yml
   modules:
   - name: "POODLE Scanner" # arbitrary
     cronspec: "@every 1d"
@@ -6,7 +6,7 @@
     - "use auxiliary/scanner/http/ssl_version"
     - "set RHOSTS SPLOITHOSTNAME" # SPLOITHOSTNAME will be subbed at runtime
     - "set RPORT SPLOITHOSTPORT" # SPLOITHOSTPORT will be subbed at runtime
-    - "set SSL_VERSION SSL3"
+    - "set SSLVersion SSL3"
     - "run"
   - name: "blahditty" # arbitrary
     cronspec: "30 * * * *"
@@ -14,10 +14,10 @@
     - "use auxiliary/ssh/blahdittyblah"
     - "set RHOST SPLOITHOSTNAME" # SPLOITHOSTNAME will be subbed at runtime
     - "set RPORT SPLOITHOSTPORT" # SPLOITHOSTPORT will be subbed at runtime
-    - "set SSL_VERSION SSL3"
+    - "set SSLVersion SSL3"
     - "run"
 
-- name: nginx
+- name: nginx # match with name in host.d/example.com.yml
   modules:
   - name: "nginx" # arbitrary
     cronspec: "30 * * * *"
@@ -25,10 +25,10 @@
     - "use auxiliary/nginx/testing123"
     - "set RHOST SPLOITHOSTNAME" # SPLOITHOSTNAME will be subbed at runtime
     - "set RPORT SPLOITHOSTPORT" # SPLOITHOSTPORT will be subbed at runtime
-    - "set SSL_VERSION SSL3"
+    - "set SSLVersion SSL3"
     - "run"
 
-- name: nginxssl
+- name: nginxssl # match with name in host.d/example.com.yml
   modules:
   - name: "nginxssl" # arbitrary
     cronspec: "30 * * * *"
@@ -36,10 +36,10 @@
     - "use auxiliary/nginxssl/ssl"
     - "set RHOST SPLOITHOSTNAME" # SPLOITHOSTNAME will be subbed at runtime
     - "set RPORT SPLOITHOSTPORT" # SPLOITHOSTPORT will be subbed at runtime
-    - "set SSL_VERSION SSL3"
+    - "set SSLVersion SSL3"
     - "run"
 
-- name: rails
+- name: rails # match with name in host.d/example.com.yml
   modules:
   - name: "railsssl" # arbitrary
     cronspec: "30 * * * *"
@@ -47,10 +47,10 @@
     - "use auxiliary/rails/railsssl"
     - "set RHOST SPLOITHOSTNAME" # SPLOITHOSTNAME will be subbed at runtime
     - "set RPORT SPLOITHOSTPORT" # SPLOITHOSTPORT will be subbed at runtime
-    - "set SSL_VERSION SSL3"
+    - "set SSLVersion SSL3"
     - "run"
 
-- name: postgres
+- name: postgres # match with name in host.d/example.com.yml
   modules:
   - name: "postgres" # arbitrary
     cronspec: "30 * * * *"
@@ -58,5 +58,5 @@
     - "use auxiliary/postgres/blahello"
     - "set RHOST SPLOITHOSTNAME" # SPLOITHOSTNAME will be subbed at runtime
     - "set RPORT SPLOITHOSTPORT" # SPLOITHOSTPORT will be subbed at runtime
-    - "set SSL_VERSION SSL3"
+    - "set SSLVersion SSL3"
     - "run"

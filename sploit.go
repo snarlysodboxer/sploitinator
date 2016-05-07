@@ -20,6 +20,7 @@ import (
 	"net/smtp"
 	"os"
 	"os/signal"
+	"path"
 	"regexp"
 	"strconv"
 	"strings"
@@ -38,7 +39,7 @@ type msfConfig struct {
 
 type sploitConfig struct {
 	WatchDir     string
-	ModulesFile  string
+	ServicesFile string
 	ServeAddress string
 	UpdateSpec   string
 	StatusSpec   string
@@ -196,11 +197,11 @@ func (daemon *Daemon) LoadSploitYaml() {
 	log.Info("Successfully loaded Sploit yaml file")
 }
 
-// read modules.yml and map service names to Metasploit modules
-func (daemon *Daemon) LoadModulesYaml() {
-	contents, err := ioutil.ReadFile(daemon.cfg.Sploit.ModulesFile)
+// read services.yml and map service names to Metasploit modules
+func (daemon *Daemon) LoadServicesYaml() {
+	contents, err := ioutil.ReadFile(daemon.cfg.Sploit.ServicesFile)
 	if err != nil {
-		message := fmt.Sprintf("Error loading modules YAML file:\n%v", err)
+		message := fmt.Sprintf("Error loading services.yml YAML file:\n%v", err)
 		log.Critical(message)
 		daemon.errorChan <- message
 		return
@@ -214,8 +215,8 @@ func (daemon *Daemon) LoadModulesYaml() {
 		return
 	}
 	daemon.Services = &services // overwrite old
-	log.Info("Successfully loaded modules yaml file")
-	log.Debug("Modules config is: %v", services)
+	log.Info("Successfully loaded services.yml file")
+	log.Debug("Services/Modules config is: %v", services)
 }
 
 // read host.yml files from host.d into daemon.Hosts
@@ -265,11 +266,11 @@ func (daemon *Daemon) SetupAPIToken() {
 		conn, err := net.Listen("tcp", address)
 		if err == nil {
 			conn.Close()
-			log.Info(fmt.Sprintf("Waiting 3 seconds for msfrpcd to take port %s", daemon.cfg.MsfRpc.Port))
+			log.Debug(fmt.Sprintf("Waiting 3 seconds for msfrpcd to take port %s", daemon.cfg.MsfRpc.Port))
 			time.Sleep(3 * time.Second)
 		} else {
 			log.Debug(fmt.Sprintf("%s", err))
-			log.Info(fmt.Sprintf("msfrpcd has taken port %s, continuing", daemon.cfg.MsfRpc.Port))
+			log.Debug(fmt.Sprintf("msfrpcd has taken port %s, continuing", daemon.cfg.MsfRpc.Port))
 			open = true
 		}
 	}
@@ -343,14 +344,12 @@ func (daemon *Daemon) CreateCronEntries() {
 
 // to be run by cron
 func (daemon *Daemon) runModuleAgainstEachHostPort(serviceName string, module *module) {
+	log.Info("Triggered cron entry for module %s", module.Name)
 	if module.Running {
-		log.Warning("Module %v is already running, not running again.", module.Name)
+		log.Warning("Module %s is already running, not running again.", module.Name)
 		return
-	} else {
-		log.Info("Running cron entry for module %v", module.Name)
 	}
 	startTime := time.Now()
-	log.Debug("%v start time", module.Name)
 	module.Running = true
 	for _, host := range daemon.Hosts {
 		for _, hostService := range host.Services {
@@ -366,8 +365,8 @@ func (daemon *Daemon) runModuleAgainstEachHostPort(serviceName string, module *m
 
 					log.Info("Initiating '%s' to run against port '%d' on '%v'.",
 						module.Name, port, host.Name)
-					log.Debug("Module details: %v", module)
-					log.Debug("Commands that will be run:\n%#v", commands)
+					log.Debug("Module details: %v", *module)
+					log.Debug("Commands that will be run: %v", commands)
 					_, err := daemon.createConsoleAndRun(commands)
 					if err != nil {
 						message := fmt.Sprintf("Error running commands in console:\n%v", err)
@@ -380,7 +379,6 @@ func (daemon *Daemon) runModuleAgainstEachHostPort(serviceName string, module *m
 		}
 	}
 	log.Info("%v took %v to run", module.Name, time.Since(startTime))
-	log.Debug("%v end time", module.Name)
 	module.Running = false
 	daemon.scanCount = daemon.scanCount + 1
 	daemon.notifierChan <- true
@@ -498,11 +496,14 @@ func (daemon *Daemon) CreateWatchers() {
 			for {
 				select {
 				case evnt := <-watcher.Events:
-					regex := regexp.MustCompilePOSIX(`.*\.yml$`)
+					// TODO grep by whole dir name
+					regex := regexp.MustCompilePOSIX(".*.yml$")
 					if regex.MatchString(evnt.Name) {
 						timer.Reset(3 * time.Second)
 						log.Debug("Reset timer for event: %v", evnt)
 						event = evnt.Name
+					} else {
+						log.Debug(fmt.Sprintf("Skipping file event: %s", evnt.Name))
 					}
 				case err := <-watcher.Errors:
 					message := fmt.Sprintf("Error with file watcher:\n%v", err)
@@ -518,7 +519,7 @@ func (daemon *Daemon) CreateWatchers() {
 				case <-timer.C:
 					log.Info("Reloading configuration after %v write", event)
 					daemon.RemoveCronEntries()
-					daemon.LoadModulesYaml()
+					daemon.LoadServicesYaml()
 					daemon.LoadHostYamls()
 					daemon.CreateCronEntries()
 				}
@@ -529,7 +530,7 @@ func (daemon *Daemon) CreateWatchers() {
 		if err != nil {
 			log.Fatal(err)
 		}
-		err = watcher.Add(daemon.cfg.Sploit.ModulesFile)
+		err = watcher.Add(path.Dir(daemon.cfg.Sploit.ServicesFile))
 		if err != nil {
 			log.Fatal(err)
 		}
@@ -572,7 +573,7 @@ func (daemon *Daemon) CreateUpdaterNotifier() {
 	if err != nil {
 		log.Fatal(err)
 	}
-	log.Debug("Setup to git pull on this schedule '%v'", daemon.cfg.Sploit.UpdateSpec)
+	log.Info("Setup to msfupdate on this schedule '%v'", daemon.cfg.Sploit.UpdateSpec)
 	daemon.internalCron.Start()
 }
 
@@ -585,7 +586,7 @@ func (daemon *Daemon) updateMsf() {
 	log.Info("Beginning an update of MSF via Git.")
 
 	commands := []string{
-		"git pull",
+		"msfupdate",
 	}
 	responseData, err := daemon.createConsoleAndRun(commands)
 	if err != nil {
@@ -594,8 +595,8 @@ func (daemon *Daemon) updateMsf() {
 		daemon.errorChan <- message
 		return
 	}
-	regex := regexp.MustCompilePOSIX("Already up-to-date")
-	// skip the rest if git pull results in "Already up-to-date"
+	regex := regexp.MustCompilePOSIX("No updates available")
+	// skip the rest if msfupdate results in "No updates available"
 	if regex.MatchString(responseData) {
 		log.Info("MSF is already up to date")
 		daemon.updateRunning = false
@@ -703,7 +704,9 @@ func (daemon *Daemon) createConsoleAndRun(commands []string) (string, error) {
 				daemon.errorChan <- message
 				return "", err
 			}
-			log.Debug("Read console %v output:\n%v", console.ID, response.Data)
+			if response.Data != "" {
+				log.Debug("Read console %v output:\n%v", console.ID, response.Data)
+			}
 			buffer.WriteString(response.Data)
 			if response.Busy {
 				log.Debug("Console %v is still busy, sleeping 3 seconds..", console.ID)
@@ -808,7 +811,7 @@ func main() {
 	daemon.waitGroup = *new(sync.WaitGroup) // supply a mechanism for staying running
 	daemon.CreateInterruptChannel()
 	daemon.CreateErrorEmailer()
-	daemon.LoadModulesYaml()
+	daemon.LoadServicesYaml()
 	daemon.LoadHostYamls()
 	daemon.OpenDBConnection()
 	address := fmt.Sprintf("http://%s:%s%s", daemon.cfg.MsfRpc.Host, daemon.cfg.MsfRpc.Port, daemon.cfg.MsfRpc.URI)

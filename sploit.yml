@@ -1,7 +1,7 @@
 # Restart Sploit if you change this file
 sploit:
   watchdir: "host.d"
-  modulesfile: "modules.yml"
+  servicesfile: "services.yml"
   serveaddress: "127.0.0.1:8080"
   updatespec: "@every 1d" # when to update MSF with git
   statusspec: "@every 1d" # when to send a status email
